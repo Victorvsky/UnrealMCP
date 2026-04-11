@@ -1,0 +1,15 @@
+[project]
+name = "unreal-mcp-server"
+version = "1.0.0"
+description = "MCP server for controlling Unreal Editor via the UnrealMCP plugin — 90+ automation tools for AI agents"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.0.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/unreal_mcp"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

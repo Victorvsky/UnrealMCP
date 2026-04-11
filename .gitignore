@@ -1,0 +1,14 @@
+# Compiled
+Binaries/
+Intermediate/
+
+# Python
+Python/.venv/
+Python/__pycache__/
+Python/src/unreal_mcp/__pycache__/
+Python/src/unreal_mcp/routers/__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
