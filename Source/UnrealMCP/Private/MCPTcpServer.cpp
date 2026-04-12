@@ -2101,7 +2101,7 @@ TSharedPtr<FJsonObject> FMCPTcpServer::HandleAddBPFunction(const TSharedPtr<FJso
 	}
 
 	UEdGraph* NewGraph = FBlueprintEditorUtils::CreateNewGraph(BP, FName(*FuncName), UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
-	FBlueprintEditorUtils::AddFunctionGraph(BP, NewGraph, true, nullptr);
+	FBlueprintEditorUtils::AddFunctionGraph<UFunction>(BP, NewGraph, true, nullptr);
 
 	bool bIsPure = false;
 	Params->TryGetBoolField(TEXT("is_pure"), bIsPure);
@@ -2160,7 +2160,7 @@ TSharedPtr<FJsonObject> FMCPTcpServer::HandleAddBPFunction(const TSharedPtr<FJso
 				}
 			}
 
-			FBlueprintEditorUtils::AddFunctionGraph(BP, NewGraph, true, nullptr);
+			FBlueprintEditorUtils::AddFunctionGraph<UFunction>(BP, NewGraph, true, nullptr);
 			// Find the function entry node and add the parameter
 			for (UEdGraphNode* Node : NewGraph->Nodes)
 			{
