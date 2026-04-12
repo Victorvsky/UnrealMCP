@@ -80,12 +80,16 @@
 #include "Blueprint/WidgetLayoutLibrary.h"
 #include "Animation/WidgetAnimation.h"
 #include "K2Node_Tunnel.h"
+#include "UObject/SavePackage.h"
+#include "Engine/SimpleConstructionScript.h"
+#include "Engine/SCS_Node.h"
 #if WITH_NIAGARA
 #include "NiagaraSystem.h"
 #include "NiagaraEmitterHandle.h"
 #include "NiagaraScript.h"
 #include "NiagaraTypes.h"
 #include "NiagaraCommon.h"
+#include "NiagaraEmitter.h"
 #endif
 #include "LevelSequence.h"
 #include "MovieScene.h"
@@ -2097,7 +2101,7 @@ TSharedPtr<FJsonObject> FMCPTcpServer::HandleAddBPFunction(const TSharedPtr<FJso
 	}
 
 	UEdGraph* NewGraph = FBlueprintEditorUtils::CreateNewGraph(BP, FName(*FuncName), UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
-	FBlueprintEditorUtils::AddFunctionGraph(BP, NewGraph, true);
+	FBlueprintEditorUtils::AddFunctionGraph(BP, NewGraph, true, nullptr);
 
 	bool bIsPure = false;
 	Params->TryGetBoolField(TEXT("is_pure"), bIsPure);
@@ -2156,7 +2160,7 @@ TSharedPtr<FJsonObject> FMCPTcpServer::HandleAddBPFunction(const TSharedPtr<FJso
 				}
 			}
 
-			FBlueprintEditorUtils::AddFunctionGraph(BP, NewGraph, true);
+			FBlueprintEditorUtils::AddFunctionGraph(BP, NewGraph, true, nullptr);
 			// Find the function entry node and add the parameter
 			for (UEdGraphNode* Node : NewGraph->Nodes)
 			{
@@ -4556,26 +4560,26 @@ TSharedPtr<FJsonObject> FMCPTcpServer::HandleSaveCurrentLevel(const TSharedPtr<F
 
 TSharedPtr<FJsonObject> FMCPTcpServer::HandleUndo(const TSharedPtr<FJsonObject>& Params)
 {
-	if (GEditor && GEditor->Trans)
+	if (GEditor)
 	{
-		bool bUndone = GEditor->Trans->Undo();
+		bool bUndone = GEditor->UndoTransaction();
 		auto Result = MCPSuccess();
 		Result->SetBoolField(TEXT("undone"), bUndone);
 		return Result;
 	}
-	return MCPError(TEXT("Transaction system not available"));
+	return MCPError(TEXT("Editor not available"));
 }
 
 TSharedPtr<FJsonObject> FMCPTcpServer::HandleRedo(const TSharedPtr<FJsonObject>& Params)
 {
-	if (GEditor && GEditor->Trans)
+	if (GEditor)
 	{
-		bool bRedone = GEditor->Trans->Redo();
+		bool bRedone = GEditor->RedoTransaction();
 		auto Result = MCPSuccess();
 		Result->SetBoolField(TEXT("redone"), bRedone);
 		return Result;
 	}
-	return MCPError(TEXT("Transaction system not available"));
+	return MCPError(TEXT("Editor not available"));
 }
 
 TSharedPtr<FJsonObject> FMCPTcpServer::HandleCreateBlueprint(const TSharedPtr<FJsonObject>& Params)
@@ -5348,7 +5352,7 @@ TSharedPtr<FJsonObject> FMCPTcpServer::HandleSetWidgetProperty(const TSharedPtr<
 	}
 
 	void* PropAddr = Prop->ContainerPtrToValuePtr<void>(TargetWidget);
-	bool bSuccess = Prop->ImportText_Direct(*Value, PropAddr, TargetWidget, PPF_None);
+	bool bSuccess = Prop->ImportText_Direct(*Value, PropAddr, TargetWidget, PPF_None) != nullptr;
 	if (!bSuccess)
 	{
 		return MCPError(FString::Printf(TEXT("Failed to set property %s to value: %s"), *PropertyName, *Value));
@@ -6183,9 +6187,9 @@ TSharedPtr<FJsonObject> FMCPTcpServer::HandleReadNiagaraSystem(const TSharedPtr<
 	// System exposed parameters (user parameters)
 	TArray<TSharedPtr<FJsonValue>> ParamArray;
 	const FNiagaraUserRedirectionParameterStore& UserParams = System->GetExposedParameters();
-	TArray<FNiagaraVariableWithOffset> SortedParams;
+	TArray<FNiagaraVariable> SortedParams;
 	UserParams.GetParameters(SortedParams);
-	for (const FNiagaraVariableWithOffset& Param : SortedParams)
+	for (const FNiagaraVariable& Param : SortedParams)
 	{
 		auto ParamObj = MakeShared<FJsonObject>();
 		ParamObj->SetStringField(TEXT("name"), Param.GetName().ToString());
@@ -6329,12 +6333,12 @@ TSharedPtr<FJsonObject> FMCPTcpServer::HandleSetNiagaraParameter(const TSharedPt
 	FNiagaraUserRedirectionParameterStore& UserParams = System->GetExposedParameters();
 
 	// Find the parameter
-	TArray<FNiagaraVariableWithOffset> AllParams;
+	TArray<FNiagaraVariable> AllParams;
 	UserParams.GetParameters(AllParams);
 
 	FNiagaraVariable FoundVar;
 	bool bFound = false;
-	for (const FNiagaraVariableWithOffset& P : AllParams)
+	for (const FNiagaraVariable& P : AllParams)
 	{
 		if (P.GetName().ToString() == ParamName)
 		{
@@ -6788,17 +6792,11 @@ TSharedPtr<FJsonObject> FMCPTcpServer::HandleAddSequenceTrack(const TSharedPtr<F
 		return MCPError(TEXT("Failed to create track."));
 	}
 
-	// Set display name if provided
-	FString DisplayName;
-	if (Params->TryGetStringField(TEXT("name"), DisplayName))
-	{
-		NewTrack->SetDisplayName(FText::FromString(DisplayName));
-	}
-
 	// Add a default section to the track
-	UMovieSceneSection* Section = NewTrack->AddSection();
+	UMovieSceneSection* Section = NewTrack->CreateNewSection();
 	if (Section)
 	{
+		NewTrack->AddSection(*Section);
 		// Set section range to match playback range
 		TRange<FFrameNumber> PlayRange = MovieScene->GetPlaybackRange();
 		Section->SetRange(PlayRange);
@@ -7412,16 +7410,11 @@ TSharedPtr<FJsonObject> FMCPTcpServer::HandleAddWidgetAnimationTrack(const TShar
 		return MCPError(TEXT("Failed to create track."));
 	}
 
-	FString DisplayName;
-	if (Params->TryGetStringField(TEXT("name"), DisplayName))
-	{
-		NewTrack->SetDisplayName(FText::FromString(DisplayName));
-	}
-
 	// Add default section spanning the animation range
-	UMovieSceneSection* Section = NewTrack->AddSection();
+	UMovieSceneSection* Section = NewTrack->CreateNewSection();
 	if (Section)
 	{
+		NewTrack->AddSection(*Section);
 		TRange<FFrameNumber> PlayRange = MovieScene->GetPlaybackRange();
 		Section->SetRange(PlayRange);
 	}
