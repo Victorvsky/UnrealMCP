@@ -1166,6 +1166,101 @@ TSharedPtr<FJsonObject> FMCPTcpServer::HandleAddBPNode(const TSharedPtr<FJsonObj
 			NewNode = CustomEventNode;
 		}
 	}
+	else if (NodeType == TEXT("ComponentBoundEvent"))
+	{
+		FString ComponentName;
+		if (!Params->TryGetStringField(TEXT("component_name"), ComponentName))
+		{
+			return MCPError(TEXT("ComponentBoundEvent requires component_name param (e.g. 'Btn_Options')"));
+		}
+
+		FString DelegateName;
+		if (!Params->TryGetStringField(TEXT("delegate_name"), DelegateName))
+		{
+			return MCPError(TEXT("ComponentBoundEvent requires delegate_name param (e.g. 'OnClicked', 'OnButtonClicked')"));
+		}
+
+		UClass* BPClass = BP->SkeletonGeneratedClass ? BP->SkeletonGeneratedClass : BP->GeneratedClass;
+		if (!BPClass)
+		{
+			return MCPError(TEXT("Blueprint has no generated class — compile it first"));
+		}
+
+		FObjectPropertyBase* ComponentProp = nullptr;
+		for (TFieldIterator<FObjectPropertyBase> It(BPClass); It; ++It)
+		{
+			if (It->GetName() == ComponentName)
+			{
+				ComponentProp = *It;
+				break;
+			}
+		}
+
+		if (!ComponentProp)
+		{
+			return MCPError(FString::Printf(TEXT("Component property '%s' not found on blueprint class. Make sure it is marked as a variable."), *ComponentName));
+		}
+
+		UClass* ComponentClass = ComponentProp->PropertyClass;
+		if (!ComponentClass)
+		{
+			return MCPError(FString::Printf(TEXT("Could not determine class for component '%s'"), *ComponentName));
+		}
+
+		FMulticastDelegateProperty* DelegateProp = nullptr;
+		for (TFieldIterator<FMulticastDelegateProperty> It(ComponentClass); It; ++It)
+		{
+			if (It->GetName() == DelegateName)
+			{
+				DelegateProp = *It;
+				break;
+			}
+		}
+
+		if (!DelegateProp)
+		{
+			FString Available;
+			for (TFieldIterator<FMulticastDelegateProperty> It(ComponentClass); It; ++It)
+			{
+				if (!Available.IsEmpty()) Available += TEXT(", ");
+				Available += It->GetName();
+			}
+			return MCPError(FString::Printf(TEXT("Delegate '%s' not found on %s. Available: %s"), *DelegateName, *ComponentClass->GetName(), *Available));
+		}
+
+		// Find the class that actually declares the delegate (may be a parent class)
+		UClass* DelegateOwner = ComponentClass;
+		for (UClass* TestClass = ComponentClass; TestClass; TestClass = TestClass->GetSuperClass())
+		{
+			if (FindFProperty<FMulticastDelegateProperty>(TestClass, DelegateProp->GetFName()))
+			{
+				DelegateOwner = TestClass;
+			}
+			else
+			{
+				break;
+			}
+		}
+
+		UE_LOG(LogUnrealMCP, Log, TEXT("Creating ComponentBoundEvent: Component='%s' Delegate='%s' OwnerClass='%s'"),
+			*ComponentName, *DelegateProp->GetName(), *DelegateOwner->GetName());
+
+		// Cast to FObjectProperty for InitializeComponentBoundEventParams
+		FObjectProperty* ObjProp = CastField<FObjectProperty>(ComponentProp);
+		if (!ObjProp)
+		{
+			return MCPError(FString::Printf(TEXT("Component property '%s' is not an FObjectProperty"), *ComponentName));
+		}
+
+		UK2Node_ComponentBoundEvent* EventNode = NewObject<UK2Node_ComponentBoundEvent>(TargetGraph);
+		EventNode->NodePosX = PosX;
+		EventNode->NodePosY = PosY;
+		TargetGraph->AddNode(EventNode, false, false);
+		// Use the proper initialization method — sets EventReference, CustomFunctionName, etc.
+		EventNode->InitializeComponentBoundEventParams(ObjProp, DelegateProp);
+		EventNode->AllocateDefaultPins();
+		NewNode = EventNode;
+	}
 	else if (NodeType == TEXT("VariableGet"))
 	{
 		FString VarName;
@@ -1545,7 +1640,7 @@ TSharedPtr<FJsonObject> FMCPTcpServer::HandleAddBPNode(const TSharedPtr<FJsonObj
 	}
 	else
 	{
-		return MCPError(FString::Printf(TEXT("Unknown node_type: %s. Supported: CallFunction, Event, VariableGet, VariableSet, Branch, Sequence, MakeStruct, BreakStruct, Cast, GetArrayItem, MakeArray, SpawnActorFromClass, Select, SwitchOnInt, SwitchOnString, SwitchOnName, CallDelegate, BindDelegate, RemoveDelegate, ClearDelegate, CreateDelegate, ForEachLoop, MacroInstance"), *NodeType));
+		return MCPError(FString::Printf(TEXT("Unknown node_type: %s. Supported: CallFunction, Event, ComponentBoundEvent, VariableGet, VariableSet, Branch, Sequence, MakeStruct, BreakStruct, Cast, GetArrayItem, MakeArray, SpawnActorFromClass, Select, SwitchOnInt, SwitchOnString, SwitchOnName, CallDelegate, BindDelegate, RemoveDelegate, ClearDelegate, CreateDelegate, ForEachLoop, MacroInstance"), *NodeType));
 	}
 
 	if (!NewNode)
@@ -2160,7 +2255,6 @@ TSharedPtr<FJsonObject> FMCPTcpServer::HandleAddBPFunction(const TSharedPtr<FJso
 				}
 			}
 
-			FBlueprintEditorUtils::AddFunctionGraph<UFunction>(BP, NewGraph, true, nullptr);
 			// Find the function entry node and add the parameter
 			for (UEdGraphNode* Node : NewGraph->Nodes)
 			{
@@ -4991,6 +5085,7 @@ void FMCPTcpServer::RegisterWidgetHandlers()
 	RegisterHandler(TEXT("add_widget_child"), [this](const TSharedPtr<FJsonObject>& Params) { return HandleAddWidgetChild(Params); });
 	RegisterHandler(TEXT("remove_widget_child"), [this](const TSharedPtr<FJsonObject>& Params) { return HandleRemoveWidgetChild(Params); });
 	RegisterHandler(TEXT("set_widget_property"), [this](const TSharedPtr<FJsonObject>& Params) { return HandleSetWidgetProperty(Params); });
+	RegisterHandler(TEXT("get_widget_property"), [this](const TSharedPtr<FJsonObject>& Params) { return HandleGetWidgetProperty(Params); });
 	RegisterHandler(TEXT("set_widget_slot"), [this](const TSharedPtr<FJsonObject>& Params) { return HandleSetWidgetSlot(Params); });
 }
 
@@ -5183,61 +5278,103 @@ TSharedPtr<FJsonObject> FMCPTcpServer::HandleAddWidgetChild(const TSharedPtr<FJs
 		return MCPError(FString::Printf(TEXT("Widget class not found: %s"), *WidgetClass));
 	}
 
-	FString WidgetName;
-	Params->TryGetStringField(TEXT("name"), WidgetName);
-	FName WFName = WidgetName.IsEmpty() ? FName(*WidgetClass) : FName(*WidgetName);
-
-	UWidget* NewWidget = WBP->WidgetTree->ConstructWidget<UWidget>(WClass, WFName);
-	if (!NewWidget)
-	{
-		return MCPError(TEXT("Failed to construct widget"));
-	}
-
-	// Find parent
+	// Find parent first (before constructing, so we can validate)
 	FString ParentName;
 	Params->TryGetStringField(TEXT("parent_name"), ParentName);
 
 	UPanelWidget* Parent = nullptr;
+	bool bSetAsRoot = false;
+
 	if (ParentName.IsEmpty())
 	{
 		Parent = Cast<UPanelWidget>(WBP->WidgetTree->RootWidget);
 		if (!Parent)
 		{
-			// If no root, set this as root if it's a panel
-			if (UPanelWidget* PanelWidget = Cast<UPanelWidget>(NewWidget))
-			{
-				WBP->WidgetTree->RootWidget = PanelWidget;
-
-				FBlueprintEditorUtils::MarkBlueprintAsModified(WBP);
-
-				auto Result = MCPSuccess();
-				Result->SetStringField(TEXT("name"), NewWidget->GetName());
-				Result->SetStringField(TEXT("class"), NewWidget->GetClass()->GetName());
-				Result->SetBoolField(TEXT("set_as_root"), true);
-				return Result;
-			}
-			return MCPError(TEXT("No root widget and new widget is not a panel"));
+			// Will set as root — validated after construction
+			bSetAsRoot = true;
 		}
 	}
 	else
 	{
+		// Search for parent widget by name
 		WBP->WidgetTree->ForEachWidget([&Parent, &ParentName](UWidget* Widget)
 		{
-			if (Widget->GetName() == ParentName)
+			if (!Parent && Widget->GetName() == ParentName)
 			{
 				Parent = Cast<UPanelWidget>(Widget);
 			}
 		});
+
+		if (!Parent)
+		{
+			return MCPError(FString::Printf(TEXT("Parent panel widget not found: %s"), *ParentName));
+		}
+
+		// Check if parent is a single-child widget (Border, SizeBox, etc.) that already has a child
+		if (UContentWidget* ContentParent = Cast<UContentWidget>(Parent))
+		{
+			if (ContentParent->GetChildrenCount() > 0)
+			{
+				return MCPError(FString::Printf(TEXT("Parent '%s' is a single-child widget (%s) and already has a child. Remove the existing child first."),
+					*ParentName, *Parent->GetClass()->GetName()));
+			}
+		}
 	}
 
-	if (!Parent)
+	// Generate a unique name to avoid FName conflicts
+	FString WidgetName;
+	Params->TryGetStringField(TEXT("name"), WidgetName);
+	FName WFName;
+	if (WidgetName.IsEmpty())
 	{
-		return MCPError(FString::Printf(TEXT("Parent panel widget not found: %s"), *ParentName));
+		WFName = MakeUniqueObjectName(WBP->WidgetTree, WClass, FName(*WidgetClass));
+	}
+	else
+	{
+		// Check if the name is already taken
+		WFName = FName(*WidgetName);
+		UObject* Existing = StaticFindObjectFast(nullptr, WBP->WidgetTree, WFName);
+		if (Existing)
+		{
+			WFName = MakeUniqueObjectName(WBP->WidgetTree, WClass, WFName);
+			UE_LOG(LogUnrealMCP, Warning, TEXT("[UnrealMCP] Widget name '%s' already taken, using '%s'"), *WidgetName, *WFName.ToString());
+		}
 	}
 
-	UPanelSlot* Slot = Parent->AddChild(NewWidget);
+	UWidget* NewWidget = WBP->WidgetTree->ConstructWidget<UWidget>(WClass, WFName);
+	if (!NewWidget)
+	{
+		return MCPError(FString::Printf(TEXT("Failed to construct widget of class: %s"), *WidgetClass));
+	}
 
-	FBlueprintEditorUtils::MarkBlueprintAsModified(WBP);
+	if (bSetAsRoot)
+	{
+		// Set as root widget
+		if (UPanelWidget* PanelWidget = Cast<UPanelWidget>(NewWidget))
+		{
+			WBP->WidgetTree->RootWidget = PanelWidget;
+
+			FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WBP);
+
+			auto Result = MCPSuccess();
+			Result->SetStringField(TEXT("name"), NewWidget->GetName());
+			Result->SetStringField(TEXT("class"), NewWidget->GetClass()->GetName());
+			Result->SetBoolField(TEXT("set_as_root"), true);
+			return Result;
+		}
+		return MCPError(TEXT("No root widget and new widget is not a panel — cannot set as root"));
+	}
+
+	// Add to parent
+	UPanelSlot* Slot = Parent->AddChild(NewWidget);
+	if (!Slot)
+	{
+		// AddChild failed — clean up the orphaned widget
+		WBP->WidgetTree->RemoveWidget(NewWidget);
+		return MCPError(FString::Printf(TEXT("Failed to add widget to parent '%s'. Parent may not accept children of this type."), *Parent->GetName()));
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WBP);
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("name"), NewWidget->GetName());
@@ -5285,8 +5422,24 @@ TSharedPtr<FJsonObject> FMCPTcpServer::HandleRemoveWidgetChild(const TSharedPtr<
 		return MCPError(FString::Printf(TEXT("Widget not found: %s"), *WidgetName));
 	}
 
+	// If removing a panel widget, also remove all its children first
+	if (UPanelWidget* PanelWidget = Cast<UPanelWidget>(TargetWidget))
+	{
+		while (PanelWidget->GetChildrenCount() > 0)
+		{
+			UWidget* Child = PanelWidget->GetChildAt(0);
+			WBP->WidgetTree->RemoveWidget(Child);
+		}
+	}
+
+	// If it's the root, clear the root reference
+	if (WBP->WidgetTree->RootWidget == TargetWidget)
+	{
+		WBP->WidgetTree->RootWidget = nullptr;
+	}
+
 	WBP->WidgetTree->RemoveWidget(TargetWidget);
-	FBlueprintEditorUtils::MarkBlueprintAsModified(WBP);
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WBP);
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("removed"), WidgetName);
@@ -5344,26 +5497,148 @@ TSharedPtr<FJsonObject> FMCPTcpServer::HandleSetWidgetProperty(const TSharedPtr<
 		return MCPError(FString::Printf(TEXT("Widget not found: %s"), *WidgetName));
 	}
 
-	// Use reflection to set the property
-	FProperty* Prop = TargetWidget->GetClass()->FindPropertyByName(FName(*PropertyName));
-	if (!Prop)
+	// Special handling for common widget properties
+	bool bHandled = false;
+
+	// TextBlock.Text — FText needs special handling
+	if (PropertyName == TEXT("Text"))
 	{
-		return MCPError(FString::Printf(TEXT("Property not found: %s on widget %s"), *PropertyName, *WidgetName));
+		if (UTextBlock* TextBlock = Cast<UTextBlock>(TargetWidget))
+		{
+			TextBlock->SetText(FText::FromString(Value));
+			bHandled = true;
+		}
+	}
+	// Visibility — ESlateVisibility enum
+	else if (PropertyName == TEXT("Visibility"))
+	{
+		ESlateVisibility NewVisibility = ESlateVisibility::Visible;
+		if (Value == TEXT("Collapsed")) NewVisibility = ESlateVisibility::Collapsed;
+		else if (Value == TEXT("Hidden")) NewVisibility = ESlateVisibility::Hidden;
+		else if (Value == TEXT("HitTestInvisible")) NewVisibility = ESlateVisibility::HitTestInvisible;
+		else if (Value == TEXT("SelfHitTestInvisible")) NewVisibility = ESlateVisibility::SelfHitTestInvisible;
+		TargetWidget->SetVisibility(NewVisibility);
+		bHandled = true;
 	}
 
-	void* PropAddr = Prop->ContainerPtrToValuePtr<void>(TargetWidget);
-	bool bSuccess = Prop->ImportText_Direct(*Value, PropAddr, TargetWidget, PPF_None) != nullptr;
-	if (!bSuccess)
+	if (!bHandled)
 	{
-		return MCPError(FString::Printf(TEXT("Failed to set property %s to value: %s"), *PropertyName, *Value));
+		// Use reflection to set the property
+		FProperty* Prop = TargetWidget->GetClass()->FindPropertyByName(FName(*PropertyName));
+		if (!Prop)
+		{
+			return MCPError(FString::Printf(TEXT("Property not found: %s on widget %s"), *PropertyName, *WidgetName));
+		}
+
+		void* PropAddr = Prop->ContainerPtrToValuePtr<void>(TargetWidget);
+		bool bSuccess = Prop->ImportText_Direct(*Value, PropAddr, TargetWidget, PPF_None) != nullptr;
+		if (!bSuccess)
+		{
+			return MCPError(FString::Printf(TEXT("Failed to set property %s to value: %s"), *PropertyName, *Value));
+		}
 	}
 
-	FBlueprintEditorUtils::MarkBlueprintAsModified(WBP);
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WBP);
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("widget"), WidgetName);
 	Result->SetStringField(TEXT("property"), PropertyName);
 	Result->SetStringField(TEXT("value"), Value);
+	return Result;
+}
+
+TSharedPtr<FJsonObject> FMCPTcpServer::HandleGetWidgetProperty(const TSharedPtr<FJsonObject>& Params)
+{
+	FString WidgetBPPath;
+	if (!Params->TryGetStringField(TEXT("widget_blueprint"), WidgetBPPath))
+	{
+		return MCPError(TEXT("Missing required param: widget_blueprint"));
+	}
+
+	FString WidgetName;
+	if (!Params->TryGetStringField(TEXT("widget_name"), WidgetName))
+	{
+		return MCPError(TEXT("Missing required param: widget_name"));
+	}
+
+	FString PropertyName;
+	if (!Params->TryGetStringField(TEXT("property_name"), PropertyName))
+	{
+		return MCPError(TEXT("Missing required param: property_name"));
+	}
+
+	UWidgetBlueprint* WBP = FindWidgetBlueprintByPath(WidgetBPPath);
+	if (!WBP)
+	{
+		return MCPError(FString::Printf(TEXT("Widget Blueprint not found: %s"), *WidgetBPPath));
+	}
+
+	if (!WBP->WidgetTree)
+	{
+		return MCPError(TEXT("Widget tree is null"));
+	}
+
+	UWidget* TargetWidget = nullptr;
+	WBP->WidgetTree->ForEachWidget([&TargetWidget, &WidgetName](UWidget* Widget)
+	{
+		if (Widget->GetName() == WidgetName)
+		{
+			TargetWidget = Widget;
+		}
+	});
+
+	if (!TargetWidget)
+	{
+		return MCPError(FString::Printf(TEXT("Widget not found: %s"), *WidgetName));
+	}
+
+	// If property_name is "*", dump all properties with non-default values
+	if (PropertyName == TEXT("*"))
+	{
+		auto Result = MCPSuccess();
+		Result->SetStringField(TEXT("widget"), WidgetName);
+		Result->SetStringField(TEXT("class"), TargetWidget->GetClass()->GetName());
+
+		TSharedPtr<FJsonObject> PropsObj = MakeShareable(new FJsonObject());
+		UObject* DefaultObj = TargetWidget->GetClass()->GetDefaultObject();
+
+		for (TFieldIterator<FProperty> It(TargetWidget->GetClass()); It; ++It)
+		{
+			FProperty* Prop = *It;
+			if (Prop->HasAnyPropertyFlags(CPF_Transient | CPF_DuplicateTransient | CPF_EditorOnly))
+				continue;
+
+			void* ValueAddr = Prop->ContainerPtrToValuePtr<void>(TargetWidget);
+			void* DefaultAddr = Prop->ContainerPtrToValuePtr<void>(DefaultObj);
+
+			if (!Prop->Identical(ValueAddr, DefaultAddr))
+			{
+				FString ValueStr;
+				Prop->ExportTextItem_Direct(ValueStr, ValueAddr, DefaultAddr, TargetWidget, PPF_None);
+				PropsObj->SetStringField(Prop->GetName(), ValueStr);
+			}
+		}
+
+		Result->SetObjectField(TEXT("properties"), PropsObj);
+		return Result;
+	}
+
+	// Single property lookup
+	FProperty* Prop = TargetWidget->GetClass()->FindPropertyByName(FName(*PropertyName));
+	if (!Prop)
+	{
+		return MCPError(FString::Printf(TEXT("Property not found: %s on widget %s (%s)"), *PropertyName, *WidgetName, *TargetWidget->GetClass()->GetName()));
+	}
+
+	void* ValueAddr = Prop->ContainerPtrToValuePtr<void>(TargetWidget);
+	FString ValueStr;
+	Prop->ExportTextItem_Direct(ValueStr, ValueAddr, nullptr, TargetWidget, PPF_None);
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("widget"), WidgetName);
+	Result->SetStringField(TEXT("property"), PropertyName);
+	Result->SetStringField(TEXT("type"), Prop->GetCPPType());
+	Result->SetStringField(TEXT("value"), ValueStr);
 	return Result;
 }
 
@@ -5664,7 +5939,7 @@ TSharedPtr<FJsonObject> FMCPTcpServer::HandleSetWidgetSlot(const TSharedPtr<FJso
 		}
 	}
 
-	FBlueprintEditorUtils::MarkBlueprintAsModified(WBP);
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WBP);
 	return Result;
 }
 

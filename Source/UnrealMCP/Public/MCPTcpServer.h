@@ -118,6 +118,7 @@ private:
 	TSharedPtr<FJsonObject> HandleAddWidgetChild(const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandleRemoveWidgetChild(const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandleSetWidgetProperty(const TSharedPtr<FJsonObject>& Params);
+	TSharedPtr<FJsonObject> HandleGetWidgetProperty(const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandleReadWidgetTree(const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandleSetWidgetSlot(const TSharedPtr<FJsonObject>& Params);
 
