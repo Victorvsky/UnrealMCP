@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Victor Bolog. All rights reserved.
+
 #pragma once
 
 #include "Modules/ModuleManager.h"

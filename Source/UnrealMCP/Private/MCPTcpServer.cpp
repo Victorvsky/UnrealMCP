@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Victor Bolog. All rights reserved.
+
 #include "MCPTcpServer.h"
 #include "Common/TcpSocketBuilder.h"
 #include "Serialization/JsonReader.h"

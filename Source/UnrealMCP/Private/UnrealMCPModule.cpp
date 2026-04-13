@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Victor Bolog. All rights reserved.
+
 #include "UnrealMCPModule.h"
 #include "MCPTcpServer.h"
 
