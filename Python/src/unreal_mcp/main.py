@@ -7,10 +7,10 @@ import logging
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.types import Tool, TextContent, ImageContent
 
 from unreal_mcp.bridge import bridge, BridgeError
-from unreal_mcp.routers import actor, blueprint, level, landscape, material, playtest, editor, component, widget, asset, datatable, niagara, sequencer, widget_animation, blueprint_macro, transport
+from unreal_mcp.routers import actor, blueprint, level, landscape, material, playtest, editor, component, widget, asset, datatable, niagara, sequencer, widget_animation, blueprint_macro, transport, capture
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("unreal-mcp")
@@ -30,6 +30,7 @@ def _register_router(module):
 
 
 _register_router(transport)
+_register_router(capture)
 _register_router(actor)
 _register_router(blueprint)
 _register_router(level)
@@ -53,13 +54,15 @@ async def list_tools() -> list[Tool]:
 
 
 @server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageContent]:
     handler = ALL_HANDLERS.get(name)
     if not handler:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
     try:
         result = await handler(arguments)
+        if isinstance(result, list):
+            return result  # handlers that return image content build the list themselves
         return [TextContent(type="text", text=result)]
     except BridgeError as e:
         return [TextContent(type="text", text=f"UE5 Bridge Error: {e}")]

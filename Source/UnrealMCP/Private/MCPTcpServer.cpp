@@ -143,6 +143,7 @@
 #include "IImageWrapperModule.h"
 #include "Misc/Base64.h"
 #include "Templates/Atomic.h"
+#include "Capture/MCPCapture.h"
 #include "HAL/ThreadSafeCounter.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Rendering/RenderingCommon.h"
@@ -188,20 +189,37 @@ static TSharedPtr<FJsonObject> MCPErrorEx(const FString& Code, const FString& Me
 	return R;
 }
 
+/** One dispatched command. Owns the completion event so that whichever side finishes last
+ *  (the socket thread giving up, or the game-thread task completing late) can still use it. */
+struct FMCPTcpServer::FPendingCommand
+{
+	enum EState : int32 { Pending = 0, Running = 1, Cancelled = 2, Finished = 3, StaleRunning = 4 };
+
+	FEvent* Event = FPlatformProcess::GetSynchEventFromPool(true);
+	TAtomic<int32> State{ Pending };
+	TSharedPtr<FJsonObject> Result;
+	FPostProcess PostProcess; // set by QueuePostProcess while the handler runs; run on the socket thread
+
+	~FPendingCommand() { FPlatformProcess::ReturnSynchEventToPool(Event); }
+};
+
 namespace
 {
-	/** One dispatched command. Owns the completion event so that whichever side finishes last
-	 *  (the socket thread giving up, or the game-thread task completing late) can still use it. */
-	struct FMCPPendingCommand
+	/** The command whose handler is executing on the game thread right now (game thread only). */
+	FMCPTcpServer::FPendingCommand* GCurrentGameThreadCommand = nullptr;
+}
+
+void FMCPTcpServer::QueuePostProcess(FPostProcess Work)
+{
+	check(IsInGameThread());
+	if (GCurrentGameThreadCommand)
 	{
-		enum EState : int32 { Pending = 0, Running = 1, Cancelled = 2, Finished = 3, StaleRunning = 4 };
-
-		FEvent* Event = FPlatformProcess::GetSynchEventFromPool(true);
-		TAtomic<int32> State{ Pending };
-		TSharedPtr<FJsonObject> Result;
-
-		~FMCPPendingCommand() { FPlatformProcess::ReturnSynchEventToPool(Event); }
-	};
+		GCurrentGameThreadCommand->PostProcess = MoveTemp(Work);
+	}
+	else
+	{
+		UE_LOG(LogUnrealMCP, Warning, TEXT("[UnrealMCP] QueuePostProcess called outside a command handler; ignored"));
+	}
 }
 
 // Helper: get editor world
@@ -271,6 +289,7 @@ bool FMCPTcpServer::Start()
 	// Register all command handlers
 	StaleState = MakeShared<FStaleState>();
 	RegisterTransportHandlers();
+	MCPCapture::RegisterHandlers(*this);
 	RegisterActorHandlers();
 	RegisterBlueprintHandlers();
 	RegisterLevelHandlers();
@@ -553,19 +572,21 @@ void FMCPTcpServer::ProcessMessage(const FString& Message, FSocket* ClientSocket
 	//   Pending -> Cancelled  : the task had not started; it will return without running.
 	//   Running -> StaleRunning: it is executing; we answer "timeout", mark it stale, and the
 	//                            task itself clears the stale flag when it finishes.
-	TSharedPtr<FMCPPendingCommand> Cmd = MakeShared<FMCPPendingCommand>();
+	TSharedPtr<FPendingCommand> Cmd = MakeShared<FPendingCommand>();
 	TSharedPtr<FStaleState> Stale = StaleState;
 
 	AsyncTask(ENamedThreads::GameThread, [Handler, Params, Cmd, Stale]()
 	{
-		int32 Expected = FMCPPendingCommand::Pending;
-		if (!Cmd->State.CompareExchange(Expected, FMCPPendingCommand::Running))
+		int32 Expected = FPendingCommand::Pending;
+		if (!Cmd->State.CompareExchange(Expected, FPendingCommand::Running))
 		{
 			return; // cancelled before it ran
 		}
+		GCurrentGameThreadCommand = Cmd.Get();
 		Cmd->Result = Handler(Params);
-		Expected = FMCPPendingCommand::Running;
-		if (!Cmd->State.CompareExchange(Expected, FMCPPendingCommand::Finished))
+		GCurrentGameThreadCommand = nullptr;
+		Expected = FPendingCommand::Running;
+		if (!Cmd->State.CompareExchange(Expected, FPendingCommand::Finished))
 		{
 			// the socket thread gave up on us: we were the stale command, and it is over now
 			Stale->Running.Decrement();
@@ -578,6 +599,12 @@ void FMCPTcpServer::ProcessMessage(const FString& Message, FSocket* ClientSocket
 	if (bCompleted && Cmd->Result.IsValid())
 	{
 		Result = Cmd->Result;
+		if (Cmd->PostProcess)
+		{
+			// Off the game thread by construction: this is the socket thread.
+			check(!IsInGameThread());
+			Cmd->PostProcess(Result);
+		}
 	}
 	else if (bCompleted)
 	{
@@ -585,8 +612,8 @@ void FMCPTcpServer::ProcessMessage(const FString& Message, FSocket* ClientSocket
 	}
 	else
 	{
-		int32 Expected = FMCPPendingCommand::Pending;
-		if (Cmd->State.CompareExchange(Expected, FMCPPendingCommand::Cancelled))
+		int32 Expected = FPendingCommand::Pending;
+		if (Cmd->State.CompareExchange(Expected, FPendingCommand::Cancelled))
 		{
 			Result = MCPErrorEx(TEXT("timeout"),
 				FString::Printf(TEXT("Command '%s' was not started within %d ms (game thread busy); it was cancelled"), *Command, CommandTimeoutMs),
@@ -599,8 +626,8 @@ void FMCPTcpServer::ProcessMessage(const FString& Message, FSocket* ClientSocket
 				FScopeLock Lock(&Stale->Mutex);
 				Stale->CommandName = Command;
 			}
-			Expected = FMCPPendingCommand::Running;
-			if (!Cmd->State.CompareExchange(Expected, FMCPPendingCommand::StaleRunning))
+			Expected = FPendingCommand::Running;
+			if (!Cmd->State.CompareExchange(Expected, FPendingCommand::StaleRunning))
 			{
 				Stale->Running.Decrement(); // it finished in the meantime
 			}

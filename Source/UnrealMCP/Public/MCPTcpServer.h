@@ -42,6 +42,17 @@ public:
 	void SetMaxLineBytes(int64 Bytes) { MaxLineBytes = FMath::Max<int64>(1024, Bytes); }
 	int64 GetMaxLineBytes() const { return MaxLineBytes; }
 
+	/** Work a handler hands off the game thread. Call from inside a handler (game thread): the
+	 *  lambda runs on the socket thread after the handler has returned and before the response
+	 *  is sent, receiving the handler's result to amend. Used for image encoding / base64 so the
+	 *  game-thread part of a capture is only trigger + readback (docs/visual-capture/ARCHITECTURE.md).
+	 *  Ignored if the command has already timed out. */
+	using FPostProcess = TFunction<void(TSharedPtr<FJsonObject>& Result)>;
+	static void QueuePostProcess(FPostProcess Work);
+
+	/** One dispatched command (defined in the .cpp; public only so the dispatch helpers can name it). */
+	struct FPendingCommand;
+
 	// FRunnable interface
 	virtual uint32 Run() override;
 	virtual void Exit() override;
