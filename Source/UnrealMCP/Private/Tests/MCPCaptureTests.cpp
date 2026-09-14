@@ -53,9 +53,11 @@ bool FMCPCaptureEditorFrameTest::RunTest(const FString& Parameters)
 		{
 			Scenario->Errors.Add(TEXT("no image object")); return false;
 		}
-		if ((*Image)->GetNumberField(TEXT("width")) != 640 || (*Image)->GetNumberField(TEXT("height")) != 360)
+		// The viewport keeps its own aspect ratio: the request is a bounding box, one edge is hit.
+		const int32 W = (int32)(*Image)->GetNumberField(TEXT("width")), H = (int32)(*Image)->GetNumberField(TEXT("height"));
+		if (W < 16 || H < 16 || W > 640 || H > 360 || (W != 640 && H != 360))
 		{
-			Scenario->Errors.Add(TEXT("image size does not match the request")); bOk = false;
+			Scenario->Errors.Add(FString::Printf(TEXT("image size %dx%d does not fit the 640x360 request"), W, H)); bOk = false;
 		}
 		TArray<uint8> Bytes;
 		if (!FBase64::Decode((*Image)->GetStringField(TEXT("data")), Bytes) || Bytes.Num() < 4 || Bytes[0] != 0xFF || Bytes[1] != 0xD8)
@@ -69,8 +71,8 @@ bool FMCPCaptureEditorFrameTest::RunTest(const FString& Parameters)
 		const TSharedPtr<FJsonObject>* Timings = nullptr;
 		if (Obj->TryGetObjectField(TEXT("timings"), Timings) && Timings && Timings->IsValid())
 		{
-			UE_LOG(LogTemp, Display, TEXT("[UnrealMCP.Capture] 640x360 jpeg: game thread capture %.1f ms, actors %.1f ms, encode %.1f ms, %d bytes"),
-				(*Timings)->GetNumberField(TEXT("game_thread_capture_ms")), (*Timings)->GetNumberField(TEXT("game_thread_actors_ms")),
+			UE_LOG(LogTemp, Display, TEXT("[UnrealMCP.Capture] %dx%d jpeg (640x360 requested): game thread capture %.1f ms, actors %.1f ms, encode %.1f ms, %d bytes"),
+				W, H, (*Timings)->GetNumberField(TEXT("game_thread_capture_ms")), (*Timings)->GetNumberField(TEXT("game_thread_actors_ms")),
 				(*Timings)->GetNumberField(TEXT("encode_ms")), Bytes.Num());
 		}
 		return bOk;

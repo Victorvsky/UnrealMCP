@@ -34,8 +34,9 @@ The plugin runs a lightweight TCP server inside the editor. A companion Python M
 
 `capture_viewport` returns a frame of the editor viewport, the PIE camera, or any camera you
 specify, as image content plus the state that explains it: camera pose and the visible actors
-with their screen boxes, world positions and distances. An agent uses it to check its own
-edits or to look at what a playtester describes. Reference: `docs/visual-capture/TOOLS.md`;
+with their screen boxes, world positions and distances. Editor and PIE captures read the live
+viewport back, so the image shows exactly what the user sees (Lumen, post process, exposure).
+An agent uses it to check its own edits or to look at what a playtester describes. Reference: `docs/visual-capture/TOOLS.md`;
 design and threading: `docs/visual-capture/ARCHITECTURE.md`. Defaults live in Project Settings
 > Plugins > MCP Capture.
 

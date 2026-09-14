@@ -45,7 +45,9 @@ def test_capture_editor_frame(live_call):
     resp = live_call("capture_viewport", {"camera": "editor", "resolution": {"w": 320, "h": 180}})
     assert resp.get("success") is True, str(resp)[:300]
     img = resp["image"]
-    assert (img["width"], img["height"]) == (320, 180)
+    # Aspect-preserving fit of the viewport into the request: one edge hits the bound.
+    w, h = img["width"], img["height"]
+    assert 16 <= w <= 320 and 16 <= h <= 180 and (w == 320 or h == 180), (w, h)
     assert base64.b64decode(img["data"])[:3] == JPEG_MAGIC
     assert isinstance(resp["actors"], list) and "camera" in resp
 

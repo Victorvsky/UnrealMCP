@@ -53,14 +53,22 @@ landscape or a skybox legitimately cover the whole frame.
 | `invalid_format` | not jpeg/png |
 | `capture_failed` / `encode_failed` | renderer readback or image encoding failed |
 
-**How it renders.** A transient `USceneCaptureComponent2D` renders the requested camera into an
-8-bit target (final tonemapped colour). Auto-exposed scenes have no adaptation history in a
-one-shot capture, so the capture keeps its view state, sets instant adaptation and renders
-twice; the result matches the editor viewport's exposure (measured: same mean luminance on a
-night scene). Pixels are read back on the game thread; JPEG/PNG encoding and base64 run on the
-socket thread after the handler has returned (see ARCHITECTURE.md).
+**How it renders.** `"editor"` and `"pie"` read the live viewport's last frame back (the editor
+viewport is drawn on demand first), so the image carries everything the user sees: Lumen, post
+process, converged exposure. Measured against a viewport screenshot at the same camera: mean
+luminance 6.2 vs 6.1 (editor), 11.0 vs 12.4 (PIE, at a different JPEG size). The viewport keeps
+its own aspect ratio: the requested size is fitted around it and the actual `width`/`height` are
+reported (a 2.9:1 editor viewport asked for 1024x576 returns 1024x347). Explicit cameras have no
+viewport and render through a transient `USceneCaptureComponent2D` (final tonemapped colour, view
+state kept, instant adaptation, two renders); that path lacks what the scene capture cannot do
+(on this project it renders night scenes markedly darker than the viewport), which `camera.source`
+reports as `"scene_capture"` versus `"viewport"`. Pixels are read back on the game thread;
+resize, JPEG/PNG encoding and base64 run on the socket thread after the handler has returned
+(see ARCHITECTURE.md).
 
-**Measured** (UE 5.7, 391-actor level, loopback client): default 1024x576 JPEG round trip
-70-200 ms; of that the game-thread part is 55-160 ms (two scene renders plus readback), the
-visible-actor pass under 1 ms, encoding about 1 ms. The first capture after editor start is the
-slow one (render-target allocation).
+**Measured** (UE 5.7, 391-actor level, loopback client): game-thread part 9-13 ms for a
+viewport readback (editor: plus the on-demand draw, 190 ms on the first call), 55-160 ms for a
+scene capture (two renders plus readback); visible-actor pass under 1 ms; resize plus encode
+about 10 ms. End to end the call waits for the next editor frame, so the round trip is bounded
+by the editor's frame rate: 40-80 ms at interactive rates, 330 ms when the editor is throttled
+to 3 FPS in the background.

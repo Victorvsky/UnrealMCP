@@ -105,10 +105,10 @@ Where each step of a capture runs, and why:
 
 | step | thread | why |
 |---|---|---|
-| choose camera, spawn the transient `USceneCaptureComponent2D`, `CaptureScene()` | game | engine requirement: scene components and scene capture are game-thread APIs |
-| pixel readback (`FRenderTarget::ReadPixels`) | game thread, blocking on the render thread | `ReadPixels` flushes rendering commands and copies the target back; it is the one unavoidable stall (measured, reported in the Phase 1 PR) and it keeps the pixel buffer's lifetime trivial |
+| choose camera; for `"editor"`/`"pie"` draw the live viewport on demand (editor) and read it back with `FViewport::ReadPixels`; for explicit cameras spawn a transient `USceneCaptureComponent2D` and `CaptureScene()` | game | engine requirement: viewports, scene components and scene capture are game-thread APIs. The live viewport is read (not re-rendered through a scene capture) because it is the only path that carries every feature the user sees; a scene capture of the same camera measured 13x darker on a night scene |
+| pixel readback (`FViewport::ReadPixels` / `FRenderTarget::ReadPixels`) | game thread, blocking on the render thread | the readback flushes rendering commands and copies the frame back; it is the one unavoidable stall (9-13 ms for a viewport frame, 55-160 ms for a scene capture; reported in the Phase 1 PR) and it keeps the pixel buffer's lifetime trivial |
 | project actor bounds, occlusion line traces | game | world queries are game-thread only; this is cheap (hundreds of actors) |
-| JPEG/PNG encode, base64, JSON assembly | **socket thread**, after the game-thread part has returned | the socket thread already exists per command and is not the game thread; no thread pool, no extra copies |
+| resize to the requested size, JPEG/PNG encode, base64, JSON assembly | **socket thread**, after the game-thread part has returned | the socket thread already exists per command and is not the game thread; no thread pool, no extra copies |
 
 Mechanism: a handler running on the game thread may call
 `FMCPTcpServer::QueuePostProcess(TFunction<void(TSharedPtr<FJsonObject>&)>)`. The server stores

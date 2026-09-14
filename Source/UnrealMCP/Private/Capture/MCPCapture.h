@@ -7,6 +7,7 @@
 
 class FMCPTcpServer;
 class UWorld;
+class FViewport;
 
 /**
  * Visual capture: a frame of the editor viewport, the PIE camera, or an arbitrary camera,
@@ -25,6 +26,10 @@ namespace MCPCapture
 		float FOV = 90.f;      // horizontal, degrees
 		UWorld* World = nullptr;
 		bool bIsPIE = false;
+		/** For "editor"/"pie": the live viewport whose last frame is read back (every feature the
+		 *  user sees - Lumen, post process, exposure). Null for explicit cameras, which render
+		 *  through a scene capture. */
+		FViewport* Viewport = nullptr;
 	};
 
 	/** One visible actor as reported to the client. */

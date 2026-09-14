@@ -27,6 +27,8 @@
 #include "Modules/ModuleManager.h"
 #include "TextureResource.h"
 #include "UnrealClient.h"
+#include "Engine/Engine.h"
+#include "Engine/GameViewportClient.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogMCPCapture, Log, All);
 
@@ -147,6 +149,7 @@ namespace
 			}
 			Out.World = World;
 			Out.bIsPIE = true;
+			Out.Viewport = (GEngine && GEngine->GameViewport) ? GEngine->GameViewport->Viewport : nullptr;
 			return nullptr;
 		}
 
@@ -166,6 +169,7 @@ namespace
 			Out.FOV = Client->ViewFOV;
 			Out.World = World;
 			Out.bIsPIE = false;
+			Out.Viewport = Client->Viewport;
 			return nullptr;
 		}
 
@@ -384,7 +388,42 @@ namespace
 			return Err;
 		}
 
-		// --- capture: transient scene capture into an 8-bit target, then a synchronous readback
+		// --- capture
+		// "editor"/"pie": read the live viewport's last frame, which carries everything the user
+		// sees (Lumen, post process, converged exposure). A scene capture of the same camera
+		// measured 13x darker on a night scene. Explicit cameras have no viewport and render
+		// through a transient scene capture; the frame is then resized to the request.
+		TArray<FColor> Pixels;
+		int32 SrcW = Width, SrcH = Height;
+		bool bRead = false;
+		double TRead = 0.0;
+		if (View.Viewport)
+		{
+			const FIntPoint Size = View.Viewport->GetSizeXY();
+			if (Size.X <= 0 || Size.Y <= 0)
+			{
+				return CaptureError(TEXT("capture_failed"), TEXT("The viewport has no size (minimised?)"));
+			}
+			if (!View.bIsPIE)
+			{
+				View.Viewport->Draw(false); // editor viewports are not realtime: render a fresh frame
+			}
+			SrcW = Size.X; SrcH = Size.Y;
+			// The viewport has its own aspect; fit the requested size around it rather than
+			// squash the frame (a 2.9:1 editor viewport into 16:9 would distort everything).
+			const double Fit = FMath::Min(static_cast<double>(Width) / SrcW, static_cast<double>(Height) / SrcH);
+			Width = FMath::Max(16, FMath::RoundToInt(SrcW * Fit));
+			Height = FMath::Max(16, FMath::RoundToInt(SrcH * Fit));
+			bRead = View.Viewport->ReadPixels(Pixels, FReadSurfaceDataFlags(RCM_UNorm, CubeFace_MAX), FIntRect(0, 0, SrcW, SrcH));
+			TRead = FPlatformTime::Seconds();
+			if (!bRead || Pixels.Num() != SrcW * SrcH)
+			{
+				return CaptureError(TEXT("capture_failed"), TEXT("Viewport readback failed"),
+					TEXT("The viewport may not have rendered yet; retry"));
+			}
+		}
+		else
+		{
 		UTextureRenderTarget2D* Target = NewObject<UTextureRenderTarget2D>(GetTransientPackage(), NAME_None, RF_Transient);
 		Target->RenderTargetFormat = RTF_RGBA8;
 		Target->ClearColor = FLinearColor::Black;
@@ -403,6 +442,8 @@ namespace
 		Capture->PostProcessSettings.bOverride_AutoExposureSpeedDown = true;
 		Capture->PostProcessSettings.AutoExposureSpeedDown = 1000.f;
 		Capture->PostProcessBlendWeight = 1.f;
+		Capture->ShowFlags.SetLumenGlobalIllumination(true);
+		Capture->ShowFlags.SetLumenReflections(true);
 		Capture->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
 		Capture->FOVAngle = View.FOV;
 		Capture->TextureTarget = Target;
@@ -411,10 +452,9 @@ namespace
 		Capture->CaptureScene();
 		Capture->CaptureScene();
 
-		TArray<FColor> Pixels;
 		FTextureRenderTargetResource* Resource = Target->GameThread_GetRenderTargetResource();
-		const bool bRead = Resource && Resource->ReadPixels(Pixels);
-		const double TRead = FPlatformTime::Seconds();
+		bRead = Resource && Resource->ReadPixels(Pixels);
+		TRead = FPlatformTime::Seconds();
 
 		Capture->UnregisterComponent();
 		Capture->MarkAsGarbage();
@@ -425,15 +465,25 @@ namespace
 			return CaptureError(TEXT("capture_failed"), TEXT("Render target readback failed"),
 				TEXT("The renderer may not be ready; retry once the editor has drawn a frame"));
 		}
+		}
 		for (FColor& C : Pixels)
 		{
-			C.A = 255; // the target's alpha is scene-dependent; the image is opaque by definition
+			C.A = 255; // alpha is scene-dependent in both paths; the image is opaque by definition
 		}
 
 		// --- state that explains the frame (game thread, cheap)
 		const bool bDebug = Params->HasField(TEXT("debug")) && Params->GetBoolField(TEXT("debug"));
 		TArray<MCPCapture::FCulledActor> Culled;
-		TArray<MCPCapture::FVisibleActor> Visible = MCPCapture::FindVisibleActors(View, Width, Height, MaxActors, bDebug ? &Culled : nullptr);
+		TArray<MCPCapture::FVisibleActor> Visible = MCPCapture::FindVisibleActors(View, SrcW, SrcH, MaxActors, bDebug ? &Culled : nullptr);
+		if (SrcW != Width || SrcH != Height)
+		{
+			const double SX = static_cast<double>(Width) / SrcW, SY = static_cast<double>(Height) / SrcH;
+			for (MCPCapture::FVisibleActor& V : Visible)
+			{
+				V.ScreenBox.Min.X = FMath::RoundToInt(V.ScreenBox.Min.X * SX); V.ScreenBox.Max.X = FMath::RoundToInt(V.ScreenBox.Max.X * SX);
+				V.ScreenBox.Min.Y = FMath::RoundToInt(V.ScreenBox.Min.Y * SY); V.ScreenBox.Max.Y = FMath::RoundToInt(V.ScreenBox.Max.Y * SY);
+			}
+		}
 		const double TActors = FPlatformTime::Seconds();
 
 		auto Result = MakeShared<FJsonObject>();
@@ -445,6 +495,7 @@ namespace
 		Camera->SetObjectField(TEXT("rotation"), RotatorJson(View.Rotation));
 		Camera->SetNumberField(TEXT("fov"), View.FOV);
 		Camera->SetStringField(TEXT("world"), View.bIsPIE ? TEXT("pie") : TEXT("editor"));
+		Camera->SetStringField(TEXT("source"), View.Viewport ? TEXT("viewport") : TEXT("scene_capture"));
 		Result->SetObjectField(TEXT("camera"), Camera);
 
 		TArray<TSharedPtr<FJsonValue>> Actors;
@@ -489,10 +540,33 @@ namespace
 		Result->SetObjectField(TEXT("timings"), Timings);
 
 		// --- encoding happens on the socket thread, after this handler has returned
-		FMCPTcpServer::QueuePostProcess([Pixels = MoveTemp(Pixels), Width, Height, Format, Quality](TSharedPtr<FJsonObject>& Out) mutable
+		FMCPTcpServer::QueuePostProcess([Pixels = MoveTemp(Pixels), SrcW, SrcH, Width, Height, Format, Quality](TSharedPtr<FJsonObject>& Out) mutable
 		{
 			check(!IsInGameThread());
 			const double TEnc0 = FPlatformTime::Seconds();
+			if (SrcW != Width || SrcH != Height)
+			{
+				// Box-filter resize (viewport size -> requested size); off the game thread.
+				TArray<FColor> Resized;
+				Resized.SetNumUninitialized(Width * Height);
+				for (int32 y = 0; y < Height; ++y)
+				{
+					const int32 Y0 = y * SrcH / Height, Y1 = FMath::Max(Y0 + 1, (y + 1) * SrcH / Height);
+					for (int32 x = 0; x < Width; ++x)
+					{
+						const int32 X0 = x * SrcW / Width, X1 = FMath::Max(X0 + 1, (x + 1) * SrcW / Width);
+						uint32 R = 0, G = 0, B = 0, N = 0;
+						for (int32 sy = Y0; sy < Y1; ++sy)
+							for (int32 sx = X0; sx < X1; ++sx)
+							{
+								const FColor& S = Pixels[sy * SrcW + sx];
+								R += S.R; G += S.G; B += S.B; ++N;
+							}
+						Resized[y * Width + x] = FColor(R / N, G / N, B / N, 255);
+					}
+				}
+				Pixels = MoveTemp(Resized);
+			}
 			IImageWrapperModule& Module = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
 			TSharedPtr<IImageWrapper> Wrapper = Module.CreateImageWrapper(Format == TEXT("png") ? EImageFormat::PNG : EImageFormat::JPEG);
 			TArray64<uint8> Bytes;
