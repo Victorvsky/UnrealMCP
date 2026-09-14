@@ -8,8 +8,30 @@ import os
 from pathlib import Path
 
 
+MAX_LINE_BYTES = 64 * 1024 * 1024
+
+
 class BridgeError(Exception):
     """Raised when the bridge encounters an error."""
+
+
+def normalize_error(response: dict) -> dict:
+    """Flatten a structured error {"error": {code, message, hint}} for the legacy handlers.
+
+    Every transport-level error and every new tool returns the structured shape. The
+    original handlers only ever look at ``response["error"]`` as a string, so the object is
+    kept under ``error_detail`` and ``error`` becomes ``"code: message (hint)"``.
+    """
+    err = response.get("error")
+    if isinstance(err, dict):
+        code = err.get("code", "error")
+        text = f"{code}: {err.get('message', '')}"
+        if err.get("hint"):
+            text += f" ({err['hint']})"
+        response = dict(response)
+        response["error_detail"] = err
+        response["error"] = text
+    return response
 
 
 class UEBridge:
@@ -51,7 +73,12 @@ class UEBridge:
         port = int(port_file.read_text().strip())
 
         try:
-            self._reader, self._writer = await asyncio.open_connection("127.0.0.1", port)
+            # Responses are single JSON lines that can run to tens of MB (screenshots, large
+            # levels); the default 64 KB StreamReader limit made list_blueprints fail on a
+            # mid-size project.
+            self._reader, self._writer = await asyncio.open_connection(
+                "127.0.0.1", port, limit=MAX_LINE_BYTES
+            )
         except ConnectionRefusedError:
             raise BridgeError(
                 f"Connection refused on port {port}. "
@@ -103,7 +130,7 @@ class UEBridge:
                         raise BridgeError("Connection closed by UE5")
 
                 response = json.loads(line.decode("utf-8"))
-                return response
+                return normalize_error(response)
 
             except asyncio.TimeoutError:
                 await self.disconnect()
