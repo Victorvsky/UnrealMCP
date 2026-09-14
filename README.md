@@ -103,3 +103,14 @@ Niagara tools are compiled conditionally. In `UnrealMCP.Build.cs`, set `bEnableN
 
 Copyright (c) 2026 victorvksy. All rights reserved.
 Licensed under the [Fab Standard License (EULA)](https://www.fab.com/eula).
+
+## Testing
+
+- **Python** (no editor needed): `cd Plugins/UnrealMCP && pip install -e "Python[dev]" && pytest Python/tests`.
+  Add `-m live` with the editor running to include the round-trip tests. `test_parity.py`
+  fails when a C++ command has no Python tool or vice versa; `test_content_sync.py` fails when
+  `Content/Python/unreal_mcp` is out of date (`python Python/tools/sync_content.py` regenerates it).
+- **Editor**: Session Frontend -> Automation -> `UnrealMCP.Transport.*`, or in the console
+  `Automation RunTests UnrealMCP.Transport`. Covers connectivity, a 5 MB multi-byte line, and
+  timeout isolation (a stalled command answers `timeout`, the next one `busy`, then recovery).
+- Errors are structured: `{"error": {"code", "message", "hint"}}`; see `docs/visual-capture/ARCHITECTURE.md`.
