@@ -409,6 +409,34 @@ void FMCPTcpServer::HandleClient(FSocket* ClientSocket)
 				{
 					const int32 ScanFrom = Pending.Num();
 					Pending.Append(RecvBuffer.GetData(), BytesRead);
+					if (static_cast<int64>(Pending.Num()) > MaxLineBytes)
+					{
+						// No newline within the cap: this is not a request we can ever parse. Answer
+						// and drop the connection rather than let the buffer grow without bound.
+						SendResponse(ClientSocket, MCPErrorEx(TEXT("line_too_long"),
+							FString::Printf(TEXT("Request exceeded %lld bytes without a newline; connection closed"), MaxLineBytes),
+							TEXT("Send one JSON object per line; large payloads must still end with '\n'")));
+						// Drain what the client is still sending before closing: closing a socket with
+						// unread bytes makes TCP reset the connection and the error line never arrives.
+						const double DrainUntil = FPlatformTime::Seconds() + 0.5;
+						while (FPlatformTime::Seconds() < DrainUntil && ClientSocket->GetConnectionState() == SCS_Connected)
+						{
+							uint32 Extra = 0;
+							int32 Discarded = 0;
+							if (ClientSocket->HasPendingData(Extra))
+							{
+								if (!ClientSocket->Recv(RecvBuffer.GetData(), RecvBuffer.Num(), Discarded) || Discarded <= 0)
+								{
+									break;
+								}
+							}
+							else
+							{
+								FPlatformProcess::Sleep(0.005f);
+							}
+						}
+						break;
+					}
 					int32 LineStart = 0;
 					for (int32 i = ScanFrom; i < Pending.Num(); ++i)
 					{

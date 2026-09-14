@@ -36,6 +36,12 @@ public:
 	int32 GetCommandTimeoutMs() const { return CommandTimeoutMs; }
 	bool IsStaleCommandRunning() const;
 
+	/** Largest single request line accepted (bytes). A client that sends more without a
+	 *  newline gets a structured "line_too_long" error and is disconnected; mirrors the
+	 *  Python bridge's MAX_LINE_BYTES. Tests lower it. */
+	void SetMaxLineBytes(int64 Bytes) { MaxLineBytes = FMath::Max<int64>(1024, Bytes); }
+	int64 GetMaxLineBytes() const { return MaxLineBytes; }
+
 	// FRunnable interface
 	virtual uint32 Run() override;
 	virtual void Exit() override;
@@ -204,6 +210,7 @@ private:
 	FThreadSafeBool bRunning = false;
 	int32 ListenPort = 0;
 	int32 CommandTimeoutMs = 30000;
+	int64 MaxLineBytes = 64LL * 1024 * 1024;
 
 	/** Shared with in-flight game-thread tasks so a stale task can report its completion
 	 *  even if the server has moved on (never capture `this` into those tasks). */

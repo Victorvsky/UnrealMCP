@@ -15,6 +15,16 @@ class BridgeError(Exception):
     """Raised when the bridge encounters an error."""
 
 
+# Commands that are safe to send twice: read-only queries and the transport probe. Only these
+# are retried automatically after a dropped connection; everything else returns
+# ``connection_lost`` and leaves the retry decision to the caller.
+IDEMPOTENT_PREFIXES = ("ping", "list_", "get_", "find_", "read_", "level_info")
+
+
+def is_idempotent(command: str) -> bool:
+    return command.startswith(IDEMPOTENT_PREFIXES)
+
+
 def normalize_error(response: dict) -> dict:
     """Flatten a structured error {"error": {code, message, hint}} for the legacy handlers.
 
@@ -120,9 +130,21 @@ class UEBridge:
 
                 line = await asyncio.wait_for(self._reader.readline(), timeout=60.0)
                 if not line:
-                    # Connection closed, try to reconnect once
+                    # The connection dropped after the write. The command may already have run
+                    # on the game thread, so resending a mutating command could execute it
+                    # twice. Reconnect for the next call, and only auto-retry commands that
+                    # are safe to repeat.
                     await self.disconnect()
                     await self.connect()
+                    if not is_idempotent(command):
+                        return normalize_error({
+                            "success": False,
+                            "error": {
+                                "code": "connection_lost",
+                                "message": f"Connection to UE5 dropped while waiting for '{command}'",
+                                "hint": "The command may or may not have executed; check state before retrying",
+                            },
+                        })
                     self._writer.write(msg.encode("utf-8"))
                     await self._writer.drain()
                     line = await asyncio.wait_for(self._reader.readline(), timeout=60.0)

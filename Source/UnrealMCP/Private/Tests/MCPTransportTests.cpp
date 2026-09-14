@@ -26,7 +26,7 @@
 namespace MCPTransportTest
 {
 	/** Open a fresh connection, send one line, read one line, close. Blocking: call off the game thread. */
-	static FString Exchange(int32 Port, const FString& Line, double TimeoutSec)
+	static FString Exchange(int32 Port, const FString& Line, double TimeoutSec, bool bAppendNewline = true)
 	{
 		ISocketSubsystem* SS = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
 		FSocket* Sock = SS->CreateSocket(NAME_Stream, TEXT("MCPTransportTest"), false);
@@ -50,7 +50,7 @@ namespace MCPTransportTest
 			FPlatformProcess::Sleep(0.02f);
 		}
 
-		FTCHARToUTF8 Utf8(*(Line + TEXT("\n")));
+		FTCHARToUTF8 Utf8(*(bAppendNewline ? Line + TEXT("\n") : Line));
 		int32 Offset = 0;
 		while (Offset < Utf8.Length())
 		{
@@ -276,6 +276,44 @@ bool FMCPTransportTimeoutIsolationTest::RunTest(const FString& Parameters)
 
 		Server->SetCommandTimeoutMs(SavedTimeout);
 		Server->UnregisterHandler(TEXT("__test_block"));
+		return bOk;
+	});
+	ADD_LATENT_AUTOMATION_COMMAND(FMCPWaitForScenario(Scenario, this));
+	return true;
+}
+
+// ------------------------------------------------------------------ receive cap
+// A client that streams bytes with no newline must be answered with line_too_long and
+// disconnected, instead of growing the receive buffer without bound.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMCPTransportLineTooLongTest, "UnrealMCP.Transport.LineTooLong", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FMCPTransportLineTooLongTest::RunTest(const FString& Parameters)
+{
+	FMCPTcpServer* Server = MCPTestServer(*this);
+	if (!Server) return false;
+	const int32 Port = Server->GetPort();
+	const int64 SavedCap = Server->GetMaxLineBytes();
+	Server->SetMaxLineBytes(1024 * 1024);
+
+	auto Scenario = MakeShared<MCPTransportTest::FScenario>();
+	Scenario->Deadline = FPlatformTime::Seconds() + 30.0;
+	Scenario->Future = Async(EAsyncExecution::Thread, [Port, Scenario, Server, SavedCap]() -> bool
+	{
+		// 2 MB of JSON-looking bytes and no terminator: the server must not wait for one.
+		FString Line = TEXT("{\"command\":\"ping\",\"params\":{\"payload\":\"");
+		const int32 Count = 2 * 1024 * 1024;
+		Line.Reserve(Count + 64);
+		for (int32 i = 0; i < Count; ++i) Line.AppendChar(TEXT('x'));
+		const FString Reply = MCPTransportTest::Exchange(Port, Line, 20.0, /*bAppendNewline*/ false);
+		const FString Code = MCPTransportTest::ErrorCode(MCPTransportTest::Parse(Reply));
+		bool bOk = true;
+		if (Code != TEXT("line_too_long")) { Scenario->Errors.Add(FString::Printf(TEXT("expected line_too_long, got: %s"), *Reply.Left(200))); bOk = false; }
+
+		// the server dropped that client and serves the next one normally
+		const FString Again = MCPTransportTest::Exchange(Port, MCPTransportTest::Request(TEXT("ping"), nullptr), 10.0);
+		TSharedPtr<FJsonObject> Obj = MCPTransportTest::Parse(Again);
+		if (!Obj.IsValid() || !Obj->GetBoolField(TEXT("success"))) { Scenario->Errors.Add(FString::Printf(TEXT("expected recovery, got: %s"), *Again.Left(200))); bOk = false; }
+
+		Server->SetMaxLineBytes(SavedCap);
 		return bOk;
 	});
 	ADD_LATENT_AUTOMATION_COMMAND(FMCPWaitForScenario(Scenario, this));
