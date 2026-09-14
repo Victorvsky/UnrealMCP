@@ -1,3 +1,5 @@
+# Copyright (c) 2026 victorvksy. All rights reserved.
+
 """Editor utility tools — save, undo/redo, console commands, asset management."""
 
 from mcp.types import Tool

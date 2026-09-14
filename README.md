@@ -1,42 +1,51 @@
-# UnrealMCP — Unreal Editor MCP Bridge
+# UnrealMCP — AI Agent Automation for Unreal Editor
 
-A TCP bridge plugin that exposes **90+ Unreal Editor automation commands** to AI agents via the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/).
+A code plugin that exposes **90+ Unreal Editor automation commands** to AI agents via the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/). Works with Claude Code, Cursor, Windsurf, Continue, Cline, and any MCP-compatible client.
 
-## Features
+## How It Works
 
-Control the Unreal Editor from any MCP-compatible AI agent:
+```
+AI Agent  <-->  Python MCP Server  <-->  TCP  <-->  UnrealMCP Plugin  <-->  Unreal Editor
+```
 
-- **Actors** — list, spawn, delete, transform, get/set properties
-- **Blueprints** — read graphs, add/remove nodes, connect pins, add variables/functions/components/event dispatchers, compile
-- **Blueprint Macros** — list, create, read macro graphs
-- **Levels** — info, find by class, find in radius, screenshots
-- **Landscapes** — create, sculpt, noise, heightmaps, paint layers, foliage
-- **Materials** — get/set parameters, create material instances
-- **Components** — list, add, remove actor components
-- **Widgets (UMG)** — read widget trees, add/remove children, set properties/slots
-- **Widget Animations** — list, read, create animations, add tracks/keyframes
-- **Data Tables** — list, read, add/remove/edit rows
-- **Sequencer** — list/read sequences, add/remove tracks, bindings, playback range
-- **Niagara** (optional) — list/read systems, get/set emitter properties and parameters
-- **Editor Utilities** — console commands, save, undo/redo, create/duplicate/delete/rename assets, open levels
-- **Playtesting** — start/stop PIE, key/mouse input, game state queries, call component functions via reflection
+The plugin runs a lightweight TCP server inside the editor. A companion Python MCP server bridges the MCP protocol to the plugin. AI agents connect and issue commands — the server handles the rest.
+
+## 90+ Tools Across 15 Categories
+
+| Category | Tools |
+|---|---|
+| **Actors** | List, spawn, delete, transform, get/set any property |
+| **Blueprints** | Read graphs, add/remove nodes, connect pins, set defaults, add variables/functions/components/dispatchers, compile |
+| **Blueprint Macros** | List, create, read macro graphs |
+| **Levels** | Level info, find actors by class or radius, screenshots |
+| **Landscapes** | Create, sculpt (brush/noise), import heightmaps, paint layers, place/clear foliage |
+| **Materials** | Get/set parameters, create material instances |
+| **Components** | List, add, remove actor components |
+| **Widgets (UMG)** | Read widget trees, add/remove children, set properties/slots |
+| **Widget Animations** | List, read, create animations, add tracks/keyframes |
+| **Data Tables** | List, read, add/remove/edit rows |
+| **Sequencer** | List/read sequences, add/remove tracks, bindings, playback range |
+| **Niagara** (optional) | List/read systems, emitter properties, parameters |
+| **Assets** | Create, duplicate, delete, rename, import, save |
+| **Editor Utilities** | Console commands, save levels, undo/redo, open levels |
+| **Playtesting** | Start/stop PIE, keyboard/mouse input, game state, component function calls via reflection |
 
 ## Installation
 
-### UE5 Plugin
+### 1. UE5 Plugin
 
-1. Copy the `UnrealMCP` folder into your project's `Plugins/` directory
-2. Regenerate project files and build
-3. The plugin starts automatically when the editor loads
+Copy the `UnrealMCP` folder into your project's `Plugins/` directory, regenerate project files, and build. The plugin starts automatically when the editor loads.
 
-### Python MCP Server
+### 2. Python MCP Server
 
 ```bash
-cd Python
+cd Plugins/UnrealMCP/Python
 pip install -e .
 ```
 
-Configure your MCP client (e.g. Claude Desktop) to use the server:
+### 3. Configure Your AI Agent
+
+Add the MCP server to your AI client's configuration (example for Claude Code / Claude Desktop):
 
 ```json
 {
@@ -83,9 +92,14 @@ Niagara tools are compiled conditionally. In `UnrealMCP.Build.cs`, set `bEnableN
 
 ## Requirements
 
-- Unreal Engine 5.1+
+- Unreal Engine 5.5 or later (tested on 5.7)
 - Python 3.11+ (for the MCP server)
+
+## Support
+
+- Documentation: https://gist.github.com/Victorvsky/0fa4e1aa6039cd2ec6e09ba2d1e37477
 
 ## License
 
-MIT
+Copyright (c) 2026 victorvksy. All rights reserved.
+Licensed under the [Fab Standard License (EULA)](https://www.fab.com/eula).

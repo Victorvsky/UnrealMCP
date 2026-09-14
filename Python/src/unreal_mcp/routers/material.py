@@ -1,3 +1,5 @@
+# Copyright (c) 2026 victorvksy. All rights reserved.
+
 """Material tools — read and modify Material Instance parameters in the UE5 editor."""
 
 from mcp.types import Tool

@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Victor Bolog. All rights reserved.
+// Copyright (c) 2026 victorvksy. All rights reserved.
 
 #include "MCPTcpServer.h"
 #include "Common/TcpSocketBuilder.h"
@@ -92,6 +92,10 @@
 #include "NiagaraTypes.h"
 #include "NiagaraCommon.h"
 #include "NiagaraEmitter.h"
+#include "NiagaraScriptSource.h"
+#include "NiagaraGraph.h"
+#include "NiagaraNodeFunctionCall.h"
+#include "NiagaraNodeOutput.h"
 #endif
 #include "LevelSequence.h"
 #include "MovieScene.h"
@@ -378,7 +382,22 @@ void FMCPTcpServer::HandleClient(FSocket* ClientSocket)
 			{
 				break;
 			}
-			FPlatformProcess::Sleep(0.001f);
+
+			// GetConnectionState cannot see a remote FIN (graceful close) — the
+			// socket stays "connected" forever and this loop wedges, blocking all
+			// future clients. A readable socket with zero pending data IS a FIN.
+			if (ClientSocket->Wait(ESocketWaitConditions::WaitForRead, FTimespan::FromMilliseconds(1)))
+			{
+				uint32 ProbeDataSize = 0;
+				if (!ClientSocket->HasPendingData(ProbeDataSize) || ProbeDataSize == 0)
+				{
+					break;
+				}
+			}
+			else
+			{
+				FPlatformProcess::Sleep(0.001f);
+			}
 		}
 	}
 
@@ -419,19 +438,26 @@ void FMCPTcpServer::ProcessMessage(const FString& Message, FSocket* ClientSocket
 	}
 
 	// Execute on Game Thread and wait for result
+	// Use TSharedPtr so the lambda and this thread share ownership safely,
+	// preventing use-after-free if the timeout fires before the game thread runs.
 	TSharedPtr<FJsonObject> Result;
+	auto ResultHolder = MakeShared<TSharedPtr<FJsonObject>>();
 	FEvent* DoneEvent = FPlatformProcess::GetSynchEventFromPool(true);
 
-	AsyncTask(ENamedThreads::GameThread, [&Handler, &Params, &Result, DoneEvent]()
+	AsyncTask(ENamedThreads::GameThread, [Handler, Params, ResultHolder, DoneEvent]()
 	{
-		Result = Handler(Params);
+		*ResultHolder = Handler(Params);
 		DoneEvent->Trigger();
 	});
 
-	DoneEvent->Wait(30000);
+	bool bCompleted = DoneEvent->Wait(30000);
 	FPlatformProcess::ReturnSynchEventToPool(DoneEvent);
 
-	if (!Result.IsValid())
+	if (bCompleted && ResultHolder->IsValid())
+	{
+		Result = *ResultHolder;
+	}
+	else
 	{
 		Result = MCPError(TEXT("Command execution timed out or failed"));
 	}
@@ -2157,14 +2183,65 @@ TSharedPtr<FJsonObject> FMCPTcpServer::HandleSetPinDefault(const TSharedPtr<FJso
 	}
 
 	const UEdGraphSchema_K2* Schema = GetDefault<UEdGraphSchema_K2>();
-	Schema->TrySetDefaultValue(*Pin, DefaultValue);
+
+	// Class/object pins store their default in DefaultObject and text pins in
+	// DefaultTextValue; TrySetDefaultValue only writes the string DefaultValue,
+	// so those categories used to fail silently. Route by pin category and
+	// verify the write actually landed.
+	const FName PinCategory = Pin->PinType.PinCategory;
+	if (PinCategory == UEdGraphSchema_K2::PC_Class || PinCategory == UEdGraphSchema_K2::PC_SoftClass)
+	{
+		UClass* Cls = DefaultValue.StartsWith(TEXT("/")) ? LoadObject<UClass>(nullptr, *DefaultValue) : nullptr;
+		if (!Cls)
+		{
+			Cls = FindClassByName(DefaultValue);
+		}
+		if (!Cls)
+		{
+			return MCPError(FString::Printf(TEXT("Class not found for class pin '%s': '%s' (short name or /Script/Module.ClassName path)"), *PinName, *DefaultValue));
+		}
+		Schema->TrySetDefaultObject(*Pin, Cls);
+		if (Pin->DefaultObject != Cls)
+		{
+			return MCPError(FString::Printf(TEXT("Schema rejected class '%s' for pin '%s' (class may not match the pin's allowed base class)"), *Cls->GetName(), *PinName));
+		}
+	}
+	else if (PinCategory == UEdGraphSchema_K2::PC_Object || PinCategory == UEdGraphSchema_K2::PC_SoftObject)
+	{
+		UObject* Obj = LoadObject<UObject>(nullptr, *DefaultValue);
+		if (!Obj)
+		{
+			return MCPError(FString::Printf(TEXT("Object not found for object pin '%s': '%s' (use a full object path)"), *PinName, *DefaultValue));
+		}
+		Schema->TrySetDefaultObject(*Pin, Obj);
+		if (Pin->DefaultObject != Obj)
+		{
+			return MCPError(FString::Printf(TEXT("Schema rejected object '%s' for pin '%s'"), *Obj->GetName(), *PinName));
+		}
+	}
+	else if (PinCategory == UEdGraphSchema_K2::PC_Text)
+	{
+		Schema->TrySetDefaultText(*Pin, FText::FromString(DefaultValue));
+		if (!Pin->DefaultTextValue.ToString().Equals(DefaultValue))
+		{
+			return MCPError(FString::Printf(TEXT("Failed to set text default on pin '%s'"), *PinName));
+		}
+	}
+	else
+	{
+		Schema->TrySetDefaultValue(*Pin, DefaultValue);
+		if (Pin->DefaultValue.IsEmpty() && !DefaultValue.IsEmpty())
+		{
+			return MCPError(FString::Printf(TEXT("Schema rejected value '%s' for pin '%s' (pin category: %s)"), *DefaultValue, *PinName, *PinCategory.ToString()));
+		}
+	}
 
 	FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("node_id"), NodeId);
 	Result->SetStringField(TEXT("pin_name"), PinName);
-	Result->SetStringField(TEXT("new_value"), Pin->DefaultValue);
+	Result->SetStringField(TEXT("new_value"), Pin->GetDefaultAsString());
 	return Result;
 }
 
@@ -4583,16 +4660,25 @@ TSharedPtr<FJsonObject> FMCPTcpServer::HandleExecuteConsoleCommand(const TShared
 		return MCPError(TEXT("Missing required param: command"));
 	}
 
-	UWorld* World = GetEditorWorld();
+	// Prefer the PIE world while a session is running so gameplay commands
+	// (ke, BugItGo, cheats) reach the game instead of the editor world.
+	// Pass world:"editor" to force the editor world during PIE.
+	UWorld* World = (GEditor && GEditor->PlayWorld) ? GEditor->PlayWorld.Get() : GetEditorWorld();
+	FString WorldParam;
+	if (Params->TryGetStringField(TEXT("world"), WorldParam) && WorldParam == TEXT("editor"))
+	{
+		World = GetEditorWorld();
+	}
 	if (!World)
 	{
-		return MCPError(TEXT("No editor world available"));
+		return MCPError(TEXT("No world available"));
 	}
 
 	GEngine->Exec(World, *Command);
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("executed"), Command);
+	Result->SetStringField(TEXT("world"), (GEditor && World == GEditor->PlayWorld) ? TEXT("pie") : TEXT("editor"));
 	return Result;
 }
 
@@ -6266,6 +6352,8 @@ void FMCPTcpServer::RegisterAssetHandlers()
 {
 	RegisterHandler(TEXT("import_asset"), [this](const TSharedPtr<FJsonObject>& Params) { return HandleImportAsset(Params); });
 	RegisterHandler(TEXT("create_material_instance"), [this](const TSharedPtr<FJsonObject>& Params) { return HandleCreateMaterialInstance(Params); });
+	RegisterHandler(TEXT("get_asset_property"), [this](const TSharedPtr<FJsonObject>& Params) { return HandleGetAssetProperty(Params); });
+	RegisterHandler(TEXT("set_asset_property"), [this](const TSharedPtr<FJsonObject>& Params) { return HandleSetAssetProperty(Params); });
 }
 
 TSharedPtr<FJsonObject> FMCPTcpServer::HandleImportAsset(const TSharedPtr<FJsonObject>& Params)
@@ -6351,6 +6439,234 @@ TSharedPtr<FJsonObject> FMCPTcpServer::HandleCreateMaterialInstance(const TShare
 	return Result;
 }
 
+// ============================================================================
+// Generic Asset Property Handlers
+// ============================================================================
+
+TSharedPtr<FJsonObject> FMCPTcpServer::HandleGetAssetProperty(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	if (!Params->TryGetStringField(TEXT("asset_path"), AssetPath))
+	{
+		return MCPError(TEXT("Missing required param: asset_path (e.g. '/Game/Audio/SA_Wisp3D.SA_Wisp3D')"));
+	}
+
+	FString PropertyName;
+	if (!Params->TryGetStringField(TEXT("property_name"), PropertyName))
+	{
+		return MCPError(TEXT("Missing required param: property_name"));
+	}
+
+	UObject* Asset = LoadObject<UObject>(nullptr, *AssetPath);
+	if (!Asset)
+	{
+		return MCPError(FString::Printf(TEXT("Asset not found: %s"), *AssetPath));
+	}
+
+	// Support nested property access with "." syntax (e.g. "Attenuation.FalloffDistance")
+	UObject* TargetObject = Asset;
+	FString ActualPropertyName = PropertyName;
+	void* StructContainer = nullptr;
+	UStruct* StructClass = nullptr;
+
+	// Walk dot-separated path for nested struct properties
+	TArray<FString> PathParts;
+	PropertyName.ParseIntoArray(PathParts, TEXT("."));
+
+	if (PathParts.Num() > 1)
+	{
+		ActualPropertyName = PathParts.Last();
+		StructClass = Asset->GetClass();
+		void* CurrentContainer = Asset;
+
+		for (int32 i = 0; i < PathParts.Num() - 1; ++i)
+		{
+			FProperty* Prop = StructClass->FindPropertyByName(FName(*PathParts[i]));
+			if (!Prop)
+			{
+				return MCPError(FString::Printf(TEXT("Property '%s' not found on %s"), *PathParts[i], *StructClass->GetName()));
+			}
+
+			if (FStructProperty* StructProp = CastField<FStructProperty>(Prop))
+			{
+				CurrentContainer = Prop->ContainerPtrToValuePtr<void>(CurrentContainer);
+				StructClass = StructProp->Struct;
+			}
+			else
+			{
+				return MCPError(FString::Printf(TEXT("Property '%s' is not a struct, cannot traverse further"), *PathParts[i]));
+			}
+		}
+
+		StructContainer = CurrentContainer;
+	}
+
+	// Find the final property
+	FProperty* Prop;
+	const void* ValuePtr;
+	UObject* ExportObj = Asset;
+
+	if (StructContainer)
+	{
+		Prop = StructClass->FindPropertyByName(FName(*ActualPropertyName));
+		if (!Prop)
+		{
+			return MCPError(FString::Printf(TEXT("Property '%s' not found in struct %s"), *ActualPropertyName, *StructClass->GetName()));
+		}
+		ValuePtr = Prop->ContainerPtrToValuePtr<void>(StructContainer);
+	}
+	else
+	{
+		Prop = Asset->GetClass()->FindPropertyByName(FName(*ActualPropertyName));
+		if (!Prop)
+		{
+			// Try listing available properties to help
+			FString AvailableProps;
+			int32 Count = 0;
+			for (TFieldIterator<FProperty> It(Asset->GetClass()); It; ++It)
+			{
+				if (Count > 0) AvailableProps += TEXT(", ");
+				AvailableProps += It->GetName();
+				if (++Count >= 30) { AvailableProps += TEXT("..."); break; }
+			}
+			return MCPError(FString::Printf(TEXT("Property '%s' not found on %s. Available: %s"),
+				*ActualPropertyName, *Asset->GetClass()->GetName(), *AvailableProps));
+		}
+		ValuePtr = Prop->ContainerPtrToValuePtr<void>(Asset);
+	}
+
+	FString ValueStr;
+	Prop->ExportTextItem_Direct(ValueStr, ValuePtr, nullptr, ExportObj, PPF_None);
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("asset"), AssetPath);
+	Result->SetStringField(TEXT("property"), PropertyName);
+	Result->SetStringField(TEXT("value"), ValueStr);
+	Result->SetStringField(TEXT("type"), Prop->GetCPPType());
+
+	// If property is a struct, also list its sub-properties
+	if (FStructProperty* StructProp = CastField<FStructProperty>(Prop))
+	{
+		TArray<TSharedPtr<FJsonValue>> SubProps;
+		for (TFieldIterator<FProperty> It(StructProp->Struct); It; ++It)
+		{
+			auto SubPropObj = MakeShared<FJsonObject>();
+			SubPropObj->SetStringField(TEXT("name"), It->GetName());
+			SubPropObj->SetStringField(TEXT("type"), It->GetCPPType());
+			SubProps.Add(MakeShared<FJsonValueObject>(SubPropObj));
+		}
+		Result->SetArrayField(TEXT("sub_properties"), SubProps);
+	}
+
+	return Result;
+}
+
+TSharedPtr<FJsonObject> FMCPTcpServer::HandleSetAssetProperty(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	if (!Params->TryGetStringField(TEXT("asset_path"), AssetPath))
+	{
+		return MCPError(TEXT("Missing required param: asset_path"));
+	}
+
+	FString PropertyName;
+	if (!Params->TryGetStringField(TEXT("property_name"), PropertyName))
+	{
+		return MCPError(TEXT("Missing required param: property_name"));
+	}
+
+	FString Value;
+	if (!Params->TryGetStringField(TEXT("value"), Value))
+	{
+		return MCPError(TEXT("Missing required param: value (UE5 text format)"));
+	}
+
+	UObject* Asset = LoadObject<UObject>(nullptr, *AssetPath);
+	if (!Asset)
+	{
+		return MCPError(FString::Printf(TEXT("Asset not found: %s"), *AssetPath));
+	}
+
+	// Walk dot-separated path for nested struct properties
+	FString ActualPropertyName = PropertyName;
+	void* StructContainer = nullptr;
+	UStruct* StructClass = nullptr;
+
+	TArray<FString> PathParts;
+	PropertyName.ParseIntoArray(PathParts, TEXT("."));
+
+	if (PathParts.Num() > 1)
+	{
+		ActualPropertyName = PathParts.Last();
+		StructClass = Asset->GetClass();
+		void* CurrentContainer = Asset;
+
+		for (int32 i = 0; i < PathParts.Num() - 1; ++i)
+		{
+			FProperty* Prop = StructClass->FindPropertyByName(FName(*PathParts[i]));
+			if (!Prop)
+			{
+				return MCPError(FString::Printf(TEXT("Property '%s' not found on %s"), *PathParts[i], *StructClass->GetName()));
+			}
+
+			if (FStructProperty* StructProp = CastField<FStructProperty>(Prop))
+			{
+				CurrentContainer = Prop->ContainerPtrToValuePtr<void>(CurrentContainer);
+				StructClass = StructProp->Struct;
+			}
+			else
+			{
+				return MCPError(FString::Printf(TEXT("Property '%s' is not a struct, cannot traverse further"), *PathParts[i]));
+			}
+		}
+
+		StructContainer = CurrentContainer;
+	}
+
+	// Find the final property
+	FProperty* Prop;
+	void* ValPtr;
+
+	if (StructContainer)
+	{
+		Prop = StructClass->FindPropertyByName(FName(*ActualPropertyName));
+		if (!Prop)
+		{
+			return MCPError(FString::Printf(TEXT("Property '%s' not found in struct %s"), *ActualPropertyName, *StructClass->GetName()));
+		}
+		ValPtr = Prop->ContainerPtrToValuePtr<void>(StructContainer);
+	}
+	else
+	{
+		Prop = Asset->GetClass()->FindPropertyByName(FName(*ActualPropertyName));
+		if (!Prop)
+		{
+			return MCPError(FString::Printf(TEXT("Property '%s' not found on %s"), *ActualPropertyName, *Asset->GetClass()->GetName()));
+		}
+		ValPtr = Prop->ContainerPtrToValuePtr<void>(Asset);
+	}
+
+	Asset->PreEditChange(Prop);
+
+	const TCHAR* ValueStream = *Value;
+	Prop->ImportText_Direct(ValueStream, ValPtr, Asset, PPF_None);
+
+	FPropertyChangedEvent ChangeEvent(Prop);
+	Asset->PostEditChangeProperty(ChangeEvent);
+	Asset->MarkPackageDirty();
+
+	// Read back the value to confirm
+	FString NewValueStr;
+	const void* ReadPtr = Prop->ContainerPtrToValuePtr<void>(StructContainer ? StructContainer : (void*)Asset);
+	Prop->ExportTextItem_Direct(NewValueStr, ReadPtr, nullptr, Asset, PPF_None);
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("asset"), AssetPath);
+	Result->SetStringField(TEXT("property"), PropertyName);
+	Result->SetStringField(TEXT("new_value"), NewValueStr);
+	return Result;
+}
+
 #if WITH_NIAGARA
 // ============================================================================
 // Niagara Handlers
@@ -6363,6 +6679,8 @@ void FMCPTcpServer::RegisterNiagaraHandlers()
 	RegisterHandler(TEXT("get_niagara_emitter_properties"), [this](const TSharedPtr<FJsonObject>& Params) { return HandleGetNiagaraEmitterProperties(Params); });
 	RegisterHandler(TEXT("set_niagara_parameter"), [this](const TSharedPtr<FJsonObject>& Params) { return HandleSetNiagaraParameter(Params); });
 	RegisterHandler(TEXT("set_niagara_emitter_enabled"), [this](const TSharedPtr<FJsonObject>& Params) { return HandleSetNiagaraEmitterEnabled(Params); });
+	RegisterHandler(TEXT("get_niagara_emitter_modules"), [this](const TSharedPtr<FJsonObject>& Params) { return HandleGetNiagaraEmitterModules(Params); });
+	RegisterHandler(TEXT("set_niagara_module_input"), [this](const TSharedPtr<FJsonObject>& Params) { return HandleSetNiagaraModuleInput(Params); });
 }
 
 TSharedPtr<FJsonObject> FMCPTcpServer::HandleListNiagaraSystems(const TSharedPtr<FJsonObject>& Params)
@@ -6775,6 +7093,407 @@ TSharedPtr<FJsonObject> FMCPTcpServer::HandleSetNiagaraEmitterEnabled(const TSha
 	Result->SetStringField(TEXT("system"), System->GetName());
 	return Result;
 }
+
+// Helper: find a Niagara system by name or path
+static UNiagaraSystem* FindNiagaraSystem(const FString& SystemPath)
+{
+	UNiagaraSystem* System = LoadObject<UNiagaraSystem>(nullptr, *SystemPath);
+	if (!System)
+	{
+		FAssetRegistryModule& AssetReg = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
+		TArray<FAssetData> Assets;
+		AssetReg.Get().GetAssetsByClass(UNiagaraSystem::StaticClass()->GetClassPathName(), Assets);
+		for (const FAssetData& Asset : Assets)
+		{
+			if (Asset.AssetName.ToString() == SystemPath)
+			{
+				System = Cast<UNiagaraSystem>(Asset.GetAsset());
+				break;
+			}
+		}
+	}
+	return System;
+}
+
+// Helper: find an emitter handle by name or index
+static int32 FindEmitterIndex(const TArray<FNiagaraEmitterHandle>& Handles, const TSharedPtr<FJsonObject>& Params)
+{
+	FString EmitterName;
+	Params->TryGetStringField(TEXT("emitter_name"), EmitterName);
+	int32 EmitterIndex = -1;
+	if (Params->HasField(TEXT("emitter_index")))
+	{
+		EmitterIndex = (int32)Params->GetNumberField(TEXT("emitter_index"));
+	}
+
+	if (EmitterIndex >= 0 && EmitterIndex < Handles.Num())
+	{
+		return EmitterIndex;
+	}
+	if (!EmitterName.IsEmpty())
+	{
+		for (int32 i = 0; i < Handles.Num(); i++)
+		{
+			if (Handles[i].GetName().ToString() == EmitterName)
+			{
+				return i;
+			}
+		}
+	}
+	return -1;
+}
+
+// Helper: serialize an RI parameter value to JSON
+static void SerializeRIParamValue(const FNiagaraParameterStore& Store, const FNiagaraVariable& Param, TSharedRef<FJsonObject> OutObj)
+{
+	FString TypeName = Param.GetType().GetName();
+	const uint8* Data = Store.GetParameterData(Param);
+	if (!Data) return;
+
+	if (TypeName == TEXT("float") || TypeName == TEXT("Float"))
+	{
+		OutObj->SetNumberField(TEXT("value"), *(const float*)Data);
+	}
+	else if (TypeName == TEXT("int32") || TypeName == TEXT("Int32"))
+	{
+		OutObj->SetNumberField(TEXT("value"), *(const int32*)Data);
+	}
+	else if (TypeName == TEXT("bool") || TypeName == TEXT("Bool") || TypeName == TEXT("NiagaraBool"))
+	{
+		FNiagaraBool BoolVal = *(const FNiagaraBool*)Data;
+		OutObj->SetBoolField(TEXT("value"), BoolVal.GetValue());
+	}
+	else if (TypeName.Contains(TEXT("Vector")))
+	{
+		const FVector3f* Vec = (const FVector3f*)Data;
+		auto VecObj = MakeShared<FJsonObject>();
+		VecObj->SetNumberField(TEXT("x"), Vec->X);
+		VecObj->SetNumberField(TEXT("y"), Vec->Y);
+		VecObj->SetNumberField(TEXT("z"), Vec->Z);
+		OutObj->SetObjectField(TEXT("value"), VecObj);
+	}
+	else if (TypeName.Contains(TEXT("Color")) || TypeName.Contains(TEXT("LinearColor")))
+	{
+		const FLinearColor* Color = (const FLinearColor*)Data;
+		auto ColObj = MakeShared<FJsonObject>();
+		ColObj->SetNumberField(TEXT("r"), Color->R);
+		ColObj->SetNumberField(TEXT("g"), Color->G);
+		ColObj->SetNumberField(TEXT("b"), Color->B);
+		ColObj->SetNumberField(TEXT("a"), Color->A);
+		OutObj->SetObjectField(TEXT("value"), ColObj);
+	}
+}
+
+TSharedPtr<FJsonObject> FMCPTcpServer::HandleGetNiagaraEmitterModules(const TSharedPtr<FJsonObject>& Params)
+{
+	FString SystemPath;
+	if (!Params->TryGetStringField(TEXT("system"), SystemPath))
+	{
+		return MCPError(TEXT("Missing required param: system"));
+	}
+
+	UNiagaraSystem* System = FindNiagaraSystem(SystemPath);
+	if (!System)
+	{
+		return MCPError(FString::Printf(TEXT("Niagara system not found: %s"), *SystemPath));
+	}
+
+	const TArray<FNiagaraEmitterHandle>& Handles = System->GetEmitterHandles();
+	int32 FoundIndex = FindEmitterIndex(Handles, Params);
+	if (FoundIndex < 0)
+	{
+		return MCPError(TEXT("Emitter not found. Provide emitter_name or emitter_index."));
+	}
+
+	const FNiagaraEmitterHandle& Handle = Handles[FoundIndex];
+	FVersionedNiagaraEmitterData* EmitterData = Handle.GetEmitterData();
+	if (!EmitterData)
+	{
+		return MCPError(TEXT("Failed to get emitter data."));
+	}
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("emitter"), Handle.GetName().ToString());
+	Result->SetNumberField(TEXT("index"), FoundIndex);
+
+	// Get modules from the graph
+	TArray<TSharedPtr<FJsonValue>> ModuleArray;
+	UNiagaraScriptSource* Source = Cast<UNiagaraScriptSource>(EmitterData->GraphSource);
+	if (Source && Source->NodeGraph)
+	{
+		TArray<UNiagaraNodeFunctionCall*> FuncNodes;
+		Source->NodeGraph->GetNodesOfClass(FuncNodes);
+
+		for (UNiagaraNodeFunctionCall* Node : FuncNodes)
+		{
+			auto ModObj = MakeShared<FJsonObject>();
+			ModObj->SetStringField(TEXT("name"), Node->GetFunctionName());
+			ModObj->SetStringField(TEXT("node_name"), Node->GetName());
+
+			// Determine script usage from connected output node
+			FString Usage = TEXT("Unknown");
+			for (UEdGraphPin* Pin : Node->Pins)
+			{
+				if (Pin->Direction == EGPD_Output)
+				{
+					for (UEdGraphPin* LinkedPin : Pin->LinkedTo)
+					{
+						if (UNiagaraNodeOutput* OutputNode = Cast<UNiagaraNodeOutput>(LinkedPin->GetOwningNode()))
+						{
+							switch (OutputNode->GetUsage())
+							{
+							case ENiagaraScriptUsage::EmitterSpawnScript: Usage = TEXT("EmitterSpawn"); break;
+							case ENiagaraScriptUsage::EmitterUpdateScript: Usage = TEXT("EmitterUpdate"); break;
+							case ENiagaraScriptUsage::ParticleSpawnScript: Usage = TEXT("ParticleSpawn"); break;
+							case ENiagaraScriptUsage::ParticleUpdateScript: Usage = TEXT("ParticleUpdate"); break;
+							default: break;
+							}
+						}
+						// Also check if linked to another function call (chained modules)
+						if (UNiagaraNodeFunctionCall* ChainedNode = Cast<UNiagaraNodeFunctionCall>(LinkedPin->GetOwningNode()))
+						{
+							// Inherit usage from the chain
+						}
+					}
+				}
+			}
+			ModObj->SetStringField(TEXT("usage"), Usage);
+
+			// Get input pins
+			TArray<TSharedPtr<FJsonValue>> InputArray;
+			for (UEdGraphPin* Pin : Node->Pins)
+			{
+				if (Pin->Direction == EGPD_Input && !Pin->bHidden)
+				{
+					auto InObj = MakeShared<FJsonObject>();
+					InObj->SetStringField(TEXT("name"), Pin->GetName());
+					InObj->SetStringField(TEXT("type"), Pin->PinType.PinCategory.ToString());
+					if (!Pin->DefaultValue.IsEmpty())
+					{
+						InObj->SetStringField(TEXT("default"), Pin->DefaultValue);
+					}
+					InputArray.Add(MakeShared<FJsonValueObject>(InObj));
+				}
+			}
+			if (InputArray.Num() > 0)
+			{
+				ModObj->SetArrayField(TEXT("inputs"), InputArray);
+			}
+
+			ModuleArray.Add(MakeShared<FJsonValueObject>(ModObj));
+		}
+	}
+	Result->SetArrayField(TEXT("modules"), ModuleArray);
+
+	// Read rapid iteration parameters from all scripts
+	TArray<TSharedPtr<FJsonValue>> RIParamArray;
+
+	auto ReadRIParams = [&](UNiagaraScript* Script, const FString& ScriptLabel)
+	{
+		if (!Script) return;
+		const FNiagaraParameterStore& RIStore = Script->RapidIterationParameters;
+		TArray<FNiagaraVariable> RIVars;
+		RIStore.GetParameters(RIVars);
+
+		for (const FNiagaraVariable& Var : RIVars)
+		{
+			auto PObj = MakeShared<FJsonObject>();
+			PObj->SetStringField(TEXT("name"), Var.GetName().ToString());
+			PObj->SetStringField(TEXT("type"), Var.GetType().GetName());
+			PObj->SetStringField(TEXT("script"), ScriptLabel);
+			SerializeRIParamValue(RIStore, Var, PObj);
+			RIParamArray.Add(MakeShared<FJsonValueObject>(PObj));
+		}
+	};
+
+	ReadRIParams(EmitterData->SpawnScriptProps.Script, TEXT("Spawn"));
+	ReadRIParams(EmitterData->UpdateScriptProps.Script, TEXT("Update"));
+
+	// Also check emitter spawn/update scripts if available
+	if (EmitterData->EmitterSpawnScriptProps.Script)
+	{
+		ReadRIParams(EmitterData->EmitterSpawnScriptProps.Script, TEXT("EmitterSpawn"));
+	}
+	if (EmitterData->EmitterUpdateScriptProps.Script)
+	{
+		ReadRIParams(EmitterData->EmitterUpdateScriptProps.Script, TEXT("EmitterUpdate"));
+	}
+
+	Result->SetArrayField(TEXT("rapid_iteration_parameters"), RIParamArray);
+
+	return Result;
+}
+
+TSharedPtr<FJsonObject> FMCPTcpServer::HandleSetNiagaraModuleInput(const TSharedPtr<FJsonObject>& Params)
+{
+	FString SystemPath;
+	if (!Params->TryGetStringField(TEXT("system"), SystemPath))
+	{
+		return MCPError(TEXT("Missing required param: system"));
+	}
+
+	FString ParamName;
+	if (!Params->TryGetStringField(TEXT("parameter_name"), ParamName))
+	{
+		return MCPError(TEXT("Missing required param: parameter_name"));
+	}
+
+	if (!Params->HasField(TEXT("value")))
+	{
+		return MCPError(TEXT("Missing required param: value"));
+	}
+
+	UNiagaraSystem* System = FindNiagaraSystem(SystemPath);
+	if (!System)
+	{
+		return MCPError(FString::Printf(TEXT("Niagara system not found: %s"), *SystemPath));
+	}
+
+	const TArray<FNiagaraEmitterHandle>& Handles = System->GetEmitterHandles();
+	int32 FoundIndex = FindEmitterIndex(Handles, Params);
+	if (FoundIndex < 0)
+	{
+		return MCPError(TEXT("Emitter not found. Provide emitter_name or emitter_index."));
+	}
+
+	const FNiagaraEmitterHandle& Handle = Handles[FoundIndex];
+	FVersionedNiagaraEmitterData* EmitterData = Handle.GetEmitterData();
+	if (!EmitterData)
+	{
+		return MCPError(TEXT("Failed to get emitter data."));
+	}
+
+	// Search for the RI parameter across all scripts
+	struct FScriptEntry
+	{
+		UNiagaraScript* Script;
+		FString Label;
+	};
+	TArray<FScriptEntry> Scripts;
+	Scripts.Add({EmitterData->SpawnScriptProps.Script, TEXT("Spawn")});
+	Scripts.Add({EmitterData->UpdateScriptProps.Script, TEXT("Update")});
+	if (EmitterData->EmitterSpawnScriptProps.Script)
+		Scripts.Add({EmitterData->EmitterSpawnScriptProps.Script, TEXT("EmitterSpawn")});
+	if (EmitterData->EmitterUpdateScriptProps.Script)
+		Scripts.Add({EmitterData->EmitterUpdateScriptProps.Script, TEXT("EmitterUpdate")});
+
+	// Optional: restrict to a specific script
+	FString ScriptFilter;
+	Params->TryGetStringField(TEXT("script"), ScriptFilter);
+
+	UNiagaraScript* TargetScript = nullptr;
+	FNiagaraVariable FoundVar;
+	FString FoundScriptLabel;
+
+	for (const FScriptEntry& Entry : Scripts)
+	{
+		if (!Entry.Script) continue;
+		if (!ScriptFilter.IsEmpty() && !Entry.Label.Contains(ScriptFilter)) continue;
+
+		FNiagaraParameterStore& RIStore = Entry.Script->RapidIterationParameters;
+		TArray<FNiagaraVariable> RIVars;
+		RIStore.GetParameters(RIVars);
+
+		for (const FNiagaraVariable& Var : RIVars)
+		{
+			if (Var.GetName().ToString().Contains(ParamName))
+			{
+				FoundVar = Var;
+				TargetScript = Entry.Script;
+				FoundScriptLabel = Entry.Label;
+				break;
+			}
+		}
+		if (TargetScript) break;
+	}
+
+	if (!TargetScript)
+	{
+		// List available params for helpful error
+		TArray<FString> Available;
+		for (const FScriptEntry& Entry : Scripts)
+		{
+			if (!Entry.Script) continue;
+			TArray<FNiagaraVariable> RIVars;
+			Entry.Script->RapidIterationParameters.GetParameters(RIVars);
+			for (const FNiagaraVariable& Var : RIVars)
+			{
+				Available.Add(FString::Printf(TEXT("[%s] %s (%s)"), *Entry.Label, *Var.GetName().ToString(), *Var.GetType().GetName()));
+			}
+		}
+		FString AvailList = FString::Join(Available, TEXT("\n  "));
+		return MCPError(FString::Printf(TEXT("RI parameter '%s' not found. Available:\n  %s"), *ParamName, *AvailList));
+	}
+
+	System->Modify();
+
+	FNiagaraParameterStore& RIStore = TargetScript->RapidIterationParameters;
+	FString TypeName = FoundVar.GetType().GetName();
+
+	if (TypeName == TEXT("float") || TypeName == TEXT("Float"))
+	{
+		float Value = (float)Params->GetNumberField(TEXT("value"));
+		RIStore.SetParameterValue(Value, FoundVar);
+	}
+	else if (TypeName == TEXT("int32") || TypeName == TEXT("Int32"))
+	{
+		int32 Value = (int32)Params->GetNumberField(TEXT("value"));
+		RIStore.SetParameterValue(Value, FoundVar);
+	}
+	else if (TypeName == TEXT("bool") || TypeName == TEXT("Bool") || TypeName == TEXT("NiagaraBool"))
+	{
+		FNiagaraBool Value(Params->GetBoolField(TEXT("value")));
+		RIStore.SetParameterValue(Value, FoundVar);
+	}
+	else if (TypeName.Contains(TEXT("Vector")))
+	{
+		const TSharedPtr<FJsonObject>* ValueObj;
+		if (Params->TryGetObjectField(TEXT("value"), ValueObj))
+		{
+			FVector3f Vec;
+			Vec.X = (float)(*ValueObj)->GetNumberField(TEXT("x"));
+			Vec.Y = (float)(*ValueObj)->GetNumberField(TEXT("y"));
+			Vec.Z = (float)(*ValueObj)->GetNumberField(TEXT("z"));
+			RIStore.SetParameterValue(Vec, FoundVar);
+		}
+		else
+		{
+			return MCPError(TEXT("Vector value requires {x, y, z} object."));
+		}
+	}
+	else if (TypeName.Contains(TEXT("Color")) || TypeName.Contains(TEXT("LinearColor")))
+	{
+		const TSharedPtr<FJsonObject>* ValueObj;
+		if (Params->TryGetObjectField(TEXT("value"), ValueObj))
+		{
+			FLinearColor Color;
+			Color.R = (float)(*ValueObj)->GetNumberField(TEXT("r"));
+			Color.G = (float)(*ValueObj)->GetNumberField(TEXT("g"));
+			Color.B = (float)(*ValueObj)->GetNumberField(TEXT("b"));
+			Color.A = (*ValueObj)->HasField(TEXT("a")) ? (float)(*ValueObj)->GetNumberField(TEXT("a")) : 1.0f;
+			RIStore.SetParameterValue(Color, FoundVar);
+		}
+		else
+		{
+			return MCPError(TEXT("Color value requires {r, g, b, a} object."));
+		}
+	}
+	else
+	{
+		return MCPError(FString::Printf(TEXT("Unsupported RI parameter type: %s"), *TypeName));
+	}
+
+	System->MarkPackageDirty();
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("parameter"), FoundVar.GetName().ToString());
+	Result->SetStringField(TEXT("type"), TypeName);
+	Result->SetStringField(TEXT("script"), FoundScriptLabel);
+	Result->SetStringField(TEXT("emitter"), Handle.GetName().ToString());
+	Result->SetStringField(TEXT("system"), System->GetName());
+	return Result;
+}
+
 #endif // WITH_NIAGARA
 
 // ============================================================================

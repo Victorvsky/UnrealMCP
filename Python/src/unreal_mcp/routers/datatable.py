@@ -1,3 +1,5 @@
+# Copyright (c) 2026 victorvksy. All rights reserved.
+
 """DataTable tools — list, read, add, edit, and remove rows in UE5 DataTables."""
 
 from mcp.types import Tool

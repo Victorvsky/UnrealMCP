@@ -1,3 +1,5 @@
+# Copyright (c) 2026 victorvksy. All rights reserved.
+
 """Widget animation tools — list, create, read, and edit UMG widget animations."""
 
 from mcp.types import Tool

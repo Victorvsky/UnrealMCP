@@ -1,3 +1,5 @@
+# Copyright (c) 2026 victorvksy. All rights reserved.
+
 """Component tools — list, add, and remove components on actors in the level."""
 
 from mcp.types import Tool

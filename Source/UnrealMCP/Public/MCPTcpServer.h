@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Victor Bolog. All rights reserved.
+// Copyright (c) 2026 victorvksy. All rights reserved.
 
 #pragma once
 
@@ -138,6 +138,8 @@ private:
 	TSharedPtr<FJsonObject> HandleGetNiagaraEmitterProperties(const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandleSetNiagaraParameter(const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandleSetNiagaraEmitterEnabled(const TSharedPtr<FJsonObject>& Params);
+	TSharedPtr<FJsonObject> HandleGetNiagaraEmitterModules(const TSharedPtr<FJsonObject>& Params);
+	TSharedPtr<FJsonObject> HandleSetNiagaraModuleInput(const TSharedPtr<FJsonObject>& Params);
 #endif
 
 	// Sequencer command implementations
@@ -163,6 +165,10 @@ private:
 	// Asset import command implementations
 	TSharedPtr<FJsonObject> HandleImportAsset(const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandleCreateMaterialInstance(const TSharedPtr<FJsonObject>& Params);
+
+	// Generic asset property commands
+	TSharedPtr<FJsonObject> HandleGetAssetProperty(const TSharedPtr<FJsonObject>& Params);
+	TSharedPtr<FJsonObject> HandleSetAssetProperty(const TSharedPtr<FJsonObject>& Params);
 
 	// Playtest command implementations
 	TSharedPtr<FJsonObject> HandleStartPIE(const TSharedPtr<FJsonObject>& Params);

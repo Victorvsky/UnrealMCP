@@ -1,3 +1,5 @@
+# Copyright (c) 2026 victorvksy. All rights reserved.
+
 """Actor tools — spawn, delete, move, and inspect actors in the UE5 editor level."""
 
 from mcp.types import Tool

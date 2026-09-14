@@ -1,3 +1,5 @@
+# Copyright (c) 2026 victorvksy. All rights reserved.
+
 """Playtest tools — PIE control, input simulation, and game state queries."""
 
 from mcp.types import Tool
@@ -270,17 +272,18 @@ async def handle_get_game_state(args: dict) -> str:
     return "\n".join(lines)
 
 
-async def handle_send_npc_dialogue(args: dict) -> str:
-    params = {"message": args["message"]}
-    if "npc_name" in args:
-        params["npc_name"] = args["npc_name"]
+async def handle_call_component_function(args: dict) -> str:
+    params = {
+        "actor_name": args["actor_name"],
+        "component_class": args["component_class"],
+        "function_name": args["function_name"],
+    }
+    if "args" in args:
+        params["args"] = args["args"]
 
-    resp = await bridge.send_command("send_npc_dialogue", params)
+    resp = await bridge.send_command("call_component_function", params)
     if "error" in resp:
         return f"Error: {resp['error']}"
 
-    return (
-        f"Message sent to {resp.get('npc', 'NPC')}!\n"
-        f"You said: \"{resp.get('message')}\"\n"
-        f"The NPC is now processing a response..."
-    )
+    result = resp.get("return_value", "void")
+    return f"Called {args['function_name']} on {args['component_class']} of {args['actor_name']}. Result: {result}"

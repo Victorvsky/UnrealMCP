@@ -1,3 +1,5 @@
+# Copyright (c) 2026 victorvksy. All rights reserved.
+
 """Landscape & foliage tools — sculpt terrain, paint layers, and scatter foliage."""
 
 from mcp.types import Tool

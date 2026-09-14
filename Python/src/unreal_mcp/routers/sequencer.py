@@ -1,3 +1,5 @@
+# Copyright (c) 2026 victorvksy. All rights reserved.
+
 """Sequencer tools — list, read, edit LevelSequence tracks, bindings, and playback ranges."""
 
 from mcp.types import Tool

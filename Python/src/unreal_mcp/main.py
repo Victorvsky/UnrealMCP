@@ -1,3 +1,5 @@
+# Copyright (c) 2026 victorvksy. All rights reserved.
+
 """Unreal MCP Server — exposes Unreal Editor tools to AI agents via MCP protocol."""
 
 import asyncio

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 victorvksy. All rights reserved.
+
 """Widget/UMG tools — read, edit, and manage Widget Blueprint hierarchies."""
 
 from mcp.types import Tool

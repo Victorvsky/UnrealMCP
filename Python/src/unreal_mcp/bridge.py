@@ -1,3 +1,5 @@
+# Copyright (c) 2026 victorvksy. All rights reserved.
+
 """Async TCP bridge client for communicating with the UnrealMCP UE5 plugin."""
 
 import asyncio

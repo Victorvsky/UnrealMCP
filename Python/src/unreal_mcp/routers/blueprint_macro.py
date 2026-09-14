@@ -1,3 +1,5 @@
+# Copyright (c) 2026 victorvksy. All rights reserved.
+
 """Blueprint macro tools — list, create, and read custom blueprint macros."""
 
 from mcp.types import Tool

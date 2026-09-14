@@ -6,17 +6,20 @@
 	"Description": "TCP bridge that exposes 90+ Unreal Editor automation commands to AI agents via the Model Context Protocol (MCP). Control actors, blueprints, landscapes, materials, Niagara, sequencer, widgets, data tables, and more.",
 	"Category": "Editor",
 	"CreatedBy": "victorvksy",
-	"CreatedByURL": "https://github.com/Victorvsky/UnrealMCP",
-	"DocsURL": "https://github.com/Victorvsky/UnrealMCP/wiki",
-	"SupportURL": "https://github.com/Victorvsky/UnrealMCP/issues",
+	"CreatedByURL": "https://gist.github.com/Victorvsky/0fa4e1aa6039cd2ec6e09ba2d1e37477",
+	"DocsURL": "https://gist.github.com/Victorvsky/0fa4e1aa6039cd2ec6e09ba2d1e37477",
+	"SupportURL": "",
+	"FabURL": "",
 	"EnabledByDefault": true,
-	"CanContainContent": false,
+	"CanContainContent": true,
 	"IsBetaVersion": false,
+	"EngineVersion": "5.7.0",
 	"Modules": [
 		{
 			"Name": "UnrealMCP",
 			"Type": "Editor",
-			"LoadingPhase": "PostEngineInit"
+			"LoadingPhase": "PostEngineInit",
+			"PlatformAllowList": ["Win64", "Mac", "Linux"]
 		}
 	]
 }

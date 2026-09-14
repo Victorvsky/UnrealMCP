@@ -1,3 +1,5 @@
+# Copyright (c) 2026 victorvksy. All rights reserved.
+
 """Level tools — query level info, find actors by class or within a radius."""
 
 from mcp.types import Tool

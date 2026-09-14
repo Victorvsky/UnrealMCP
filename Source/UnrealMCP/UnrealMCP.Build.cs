@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Victor Bolog. All rights reserved.
+// Copyright (c) 2026 victorvksy. All rights reserved.
 
 using UnrealBuildTool;
 

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 victorvksy. All rights reserved.
+
 """Blueprint tools — list, read, edit, and compile Blueprints in the UE5 editor."""
 
 from mcp.types import Tool
