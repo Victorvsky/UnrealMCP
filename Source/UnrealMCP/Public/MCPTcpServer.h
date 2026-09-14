@@ -6,6 +6,8 @@
 #include "Dom/JsonObject.h"
 #include "HAL/Runnable.h"
 #include "Sockets.h"
+#include "HAL/ThreadSafeBool.h"
+#include "HAL/ThreadSafeCounter.h"
 
 DECLARE_LOG_CATEGORY_EXTERN(LogUnrealMCP, Log, All);
 
@@ -20,6 +22,25 @@ public:
 
 	using FCommandHandler = TFunction<TSharedPtr<FJsonObject>(const TSharedPtr<FJsonObject>& Params)>;
 	void RegisterHandler(const FString& CommandName, FCommandHandler Handler);
+	bool UnregisterHandler(const FString& CommandName);
+
+	/** Port the listener bound to (0 until Start() succeeded). */
+	int32 GetPort() const { return ListenPort; }
+
+	/** How long the socket thread waits for a command to finish on the game thread.
+	 *  A command that outlives this wait is answered with a structured "timeout" error and
+	 *  marked stale; while a stale command is still running every new command is refused
+	 *  with a "busy" error instead of being dispatched on top of it (see
+	 *  docs/visual-capture/ARCHITECTURE.md). Tests lower this to exercise that path. */
+	void SetCommandTimeoutMs(int32 Ms) { CommandTimeoutMs = FMath::Max(1, Ms); }
+	int32 GetCommandTimeoutMs() const { return CommandTimeoutMs; }
+	bool IsStaleCommandRunning() const;
+
+	/** Largest single request line accepted (bytes). A client that sends more without a
+	 *  newline gets a structured "line_too_long" error and is disconnected; mirrors the
+	 *  Python bridge's MAX_LINE_BYTES. Tests lower it. */
+	void SetMaxLineBytes(int64 Bytes) { MaxLineBytes = FMath::Max<int64>(1024, Bytes); }
+	int64 GetMaxLineBytes() const { return MaxLineBytes; }
 
 	// FRunnable interface
 	virtual uint32 Run() override;
@@ -31,6 +52,7 @@ private:
 	void SendResponse(FSocket* ClientSocket, const TSharedPtr<FJsonObject>& Response);
 	void WritePortFile(int32 Port);
 
+	void RegisterTransportHandlers();
 	void RegisterActorHandlers();
 	void RegisterBlueprintHandlers();
 	void RegisterLevelHandlers();
@@ -180,9 +202,25 @@ private:
 	TSharedPtr<FJsonObject> HandleGetGameState(const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandleCallComponentFunction(const TSharedPtr<FJsonObject>& Params);
 
+	// Transport command implementations
+	TSharedPtr<FJsonObject> HandlePing(const TSharedPtr<FJsonObject>& Params);
+
 	FSocket* ListenerSocket = nullptr;
 	FRunnableThread* Thread = nullptr;
 	FThreadSafeBool bRunning = false;
+	int32 ListenPort = 0;
+	int32 CommandTimeoutMs = 30000;
+	int64 MaxLineBytes = 64LL * 1024 * 1024;
+
+	/** Shared with in-flight game-thread tasks so a stale task can report its completion
+	 *  even if the server has moved on (never capture `this` into those tasks). */
+	struct FStaleState
+	{
+		FThreadSafeCounter Running;
+		FCriticalSection Mutex;
+		FString CommandName;
+	};
+	TSharedPtr<FStaleState> StaleState;
 
 	TMap<FString, FCommandHandler> CommandHandlers;
 	FCriticalSection HandlersMutex;

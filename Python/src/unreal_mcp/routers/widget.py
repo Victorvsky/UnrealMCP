@@ -97,6 +97,28 @@ def get_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="get_widget_property",
+            description="Read a property of a widget in a Widget Blueprint using reflection (text export format).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "widget_blueprint": {
+                        "type": "string",
+                        "description": "Widget Blueprint name or path.",
+                    },
+                    "widget_name": {
+                        "type": "string",
+                        "description": "Name of the widget to read.",
+                    },
+                    "property_name": {
+                        "type": "string",
+                        "description": "Property name (e.g. 'Visibility', 'Brush', 'ColorAndOpacity').",
+                    },
+                },
+                "required": ["widget_blueprint", "widget_name", "property_name"],
+            },
+        ),
+        Tool(
             name="set_widget_property",
             description=(
                 "Set a property on a widget in a Widget Blueprint using reflection. "
@@ -234,6 +256,7 @@ def get_handlers() -> dict:
         "list_widget_children": handle_list_widget_children,
         "add_widget_child": handle_add_widget_child,
         "remove_widget_child": handle_remove_widget_child,
+        "get_widget_property": handle_get_widget_property,
         "set_widget_property": handle_set_widget_property,
         "set_widget_slot": handle_set_widget_slot,
     }
@@ -319,6 +342,18 @@ async def handle_remove_widget_child(args: dict) -> str:
         return f"Error: {resp['error']}"
 
     return f"Removed widget: {resp.get('removed', '')}"
+
+
+async def handle_get_widget_property(args: dict) -> str:
+    resp = await bridge.send_command("get_widget_property", {
+        "widget_blueprint": args["widget_blueprint"],
+        "widget_name": args["widget_name"],
+        "property_name": args["property_name"],
+    })
+    if "error" in resp:
+        return f"Error: {resp['error']}"
+
+    return f"{resp.get('widget', '')}.{resp.get('property', '')} [{resp.get('type', '')}] = {resp.get('value', '')}"
 
 
 async def handle_set_widget_property(args: dict) -> str:

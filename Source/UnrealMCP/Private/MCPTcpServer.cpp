@@ -142,6 +142,8 @@
 #include "IImageWrapper.h"
 #include "IImageWrapperModule.h"
 #include "Misc/Base64.h"
+#include "Templates/Atomic.h"
+#include "HAL/ThreadSafeCounter.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Rendering/RenderingCommon.h"
 #include "Materials/MaterialInstanceConstant.h"
@@ -166,6 +168,40 @@ static TSharedPtr<FJsonObject> MCPError(const FString& Message)
 	auto R = MakeShared<FJsonObject>();
 	R->SetStringField(TEXT("error"), Message);
 	return R;
+}
+
+// Helper: structured error response {"error": {"code", "message", "hint"}} - the shape every
+// transport-level error and every new tool uses. The Python bridge flattens it for the
+// legacy handlers, which only look at resp["error"].
+static TSharedPtr<FJsonObject> MCPErrorEx(const FString& Code, const FString& Message, const FString& Hint = FString())
+{
+	auto Err = MakeShared<FJsonObject>();
+	Err->SetStringField(TEXT("code"), Code);
+	Err->SetStringField(TEXT("message"), Message);
+	if (!Hint.IsEmpty())
+	{
+		Err->SetStringField(TEXT("hint"), Hint);
+	}
+	auto R = MakeShared<FJsonObject>();
+	R->SetBoolField(TEXT("success"), false);
+	R->SetObjectField(TEXT("error"), Err);
+	return R;
+}
+
+namespace
+{
+	/** One dispatched command. Owns the completion event so that whichever side finishes last
+	 *  (the socket thread giving up, or the game-thread task completing late) can still use it. */
+	struct FMCPPendingCommand
+	{
+		enum EState : int32 { Pending = 0, Running = 1, Cancelled = 2, Finished = 3, StaleRunning = 4 };
+
+		FEvent* Event = FPlatformProcess::GetSynchEventFromPool(true);
+		TAtomic<int32> State{ Pending };
+		TSharedPtr<FJsonObject> Result;
+
+		~FMCPPendingCommand() { FPlatformProcess::ReturnSynchEventToPool(Event); }
+	};
 }
 
 // Helper: get editor world
@@ -233,6 +269,8 @@ FMCPTcpServer::~FMCPTcpServer()
 bool FMCPTcpServer::Start()
 {
 	// Register all command handlers
+	StaleState = MakeShared<FStaleState>();
+	RegisterTransportHandlers();
 	RegisterActorHandlers();
 	RegisterBlueprintHandlers();
 	RegisterLevelHandlers();
@@ -272,6 +310,7 @@ bool FMCPTcpServer::Start()
 	UE_LOG(LogUnrealMCP, Log, TEXT("[UnrealMCP] Listening on 127.0.0.1:%d"), AssignedPort);
 
 	// Write port file
+	ListenPort = AssignedPort;
 	WritePortFile(AssignedPort);
 
 	// Start listener thread
@@ -311,6 +350,17 @@ void FMCPTcpServer::RegisterHandler(const FString& CommandName, FCommandHandler 
 	CommandHandlers.Add(CommandName, MoveTemp(Handler));
 }
 
+bool FMCPTcpServer::UnregisterHandler(const FString& CommandName)
+{
+	FScopeLock Lock(&HandlersMutex);
+	return CommandHandlers.Remove(CommandName) > 0;
+}
+
+bool FMCPTcpServer::IsStaleCommandRunning() const
+{
+	return StaleState.IsValid() && StaleState->Running.GetValue() > 0;
+}
+
 uint32 FMCPTcpServer::Run()
 {
 	while (bRunning)
@@ -340,7 +390,10 @@ void FMCPTcpServer::Exit()
 
 void FMCPTcpServer::HandleClient(FSocket* ClientSocket)
 {
-	FString Buffer;
+	// Accumulate BYTES and decode a line only once its '\n' has arrived: a UTF-8 sequence can
+	// straddle two recv() calls, the old byte-count-as-char-count conversion truncated any
+	// non-ASCII message, and a single JSON line may be several MB (base64 images).
+	TArray<uint8> Pending;
 	TArray<uint8> RecvBuffer;
 	RecvBuffer.SetNumUninitialized(65536);
 
@@ -354,19 +407,59 @@ void FMCPTcpServer::HandleClient(FSocket* ClientSocket)
 			{
 				if (BytesRead > 0)
 				{
-					FString Chunk = FString(BytesRead, UTF8_TO_TCHAR((const char*)RecvBuffer.GetData()));
-					Buffer += Chunk;
-
-					FString LeftPart;
-					FString RightPart;
-					while (Buffer.Split(TEXT("\n"), &LeftPart, &RightPart))
+					const int32 ScanFrom = Pending.Num();
+					Pending.Append(RecvBuffer.GetData(), BytesRead);
+					if (static_cast<int64>(Pending.Num()) > MaxLineBytes)
 					{
-						LeftPart.TrimStartAndEndInline();
-						if (!LeftPart.IsEmpty())
+						// No newline within the cap: this is not a request we can ever parse. Answer
+						// and drop the connection rather than let the buffer grow without bound.
+						SendResponse(ClientSocket, MCPErrorEx(TEXT("line_too_long"),
+							FString::Printf(TEXT("Request exceeded %lld bytes without a newline; connection closed"), MaxLineBytes),
+							TEXT("Send one JSON object per line; large payloads must still end with '\n'")));
+						// Drain what the client is still sending before closing: closing a socket with
+						// unread bytes makes TCP reset the connection and the error line never arrives.
+						const double DrainUntil = FPlatformTime::Seconds() + 0.5;
+						while (FPlatformTime::Seconds() < DrainUntil && ClientSocket->GetConnectionState() == SCS_Connected)
 						{
-							ProcessMessage(LeftPart, ClientSocket);
+							uint32 Extra = 0;
+							int32 Discarded = 0;
+							if (ClientSocket->HasPendingData(Extra))
+							{
+								if (!ClientSocket->Recv(RecvBuffer.GetData(), RecvBuffer.Num(), Discarded) || Discarded <= 0)
+								{
+									break;
+								}
+							}
+							else
+							{
+								FPlatformProcess::Sleep(0.005f);
+							}
 						}
-						Buffer = RightPart;
+						break;
+					}
+					int32 LineStart = 0;
+					for (int32 i = ScanFrom; i < Pending.Num(); ++i)
+					{
+						if (Pending[i] != '\n')
+						{
+							continue;
+						}
+						const int32 Len = i - LineStart;
+						if (Len > 0)
+						{
+							FUTF8ToTCHAR Converter(reinterpret_cast<const ANSICHAR*>(Pending.GetData() + LineStart), Len);
+							FString Line(Converter.Length(), Converter.Get());
+							Line.TrimStartAndEndInline();
+							if (!Line.IsEmpty())
+							{
+								ProcessMessage(Line, ClientSocket);
+							}
+						}
+						LineStart = i + 1;
+					}
+					if (LineStart > 0)
+					{
+						Pending.RemoveAt(0, LineStart, EAllowShrinking::No);
 					}
 				}
 			}
@@ -408,13 +501,30 @@ void FMCPTcpServer::HandleClient(FSocket* ClientSocket)
 
 void FMCPTcpServer::ProcessMessage(const FString& Message, FSocket* ClientSocket)
 {
-	UE_LOG(LogUnrealMCP, Log, TEXT("[UnrealMCP] Received: %s"), *Message);
+	// Messages can be several MB (base64 images); never put more than a preview in the log.
+	UE_LOG(LogUnrealMCP, Log, TEXT("[UnrealMCP] Received (%d chars): %s"), Message.Len(), *Message.Left(300));
 
 	TSharedPtr<FJsonObject> JsonMsg;
 	auto Reader = TJsonReaderFactory<>::Create(Message);
 	if (!FJsonSerializer::Deserialize(Reader, JsonMsg) || !JsonMsg.IsValid())
 	{
-		SendResponse(ClientSocket, MCPError(TEXT("Invalid JSON")));
+		SendResponse(ClientSocket, MCPErrorEx(TEXT("invalid_json"), TEXT("Message is not a JSON object"),
+			TEXT("Send one {\"command\", \"params\"} object per line")));
+		return;
+	}
+
+	// A command that timed out is still executing on the game thread: refuse to stack another
+	// on top of it (the two would interleave and corrupt any stateful tool).
+	if (IsStaleCommandRunning())
+	{
+		FString StaleName;
+		{
+			FScopeLock Lock(&StaleState->Mutex);
+			StaleName = StaleState->CommandName;
+		}
+		SendResponse(ClientSocket, MCPErrorEx(TEXT("busy"),
+			FString::Printf(TEXT("Previous command '%s' timed out and is still running on the game thread"), *StaleName),
+			TEXT("Wait and retry; if it never clears the editor is probably blocked by a modal dialog")));
 		return;
 	}
 
@@ -431,38 +541,101 @@ void FMCPTcpServer::ProcessMessage(const FString& Message, FSocket* ClientSocket
 		auto* Found = CommandHandlers.Find(Command);
 		if (!Found)
 		{
-			SendResponse(ClientSocket, MCPError(FString::Printf(TEXT("Unknown command: %s"), *Command)));
+			SendResponse(ClientSocket, MCPErrorEx(TEXT("unknown_command"), FString::Printf(TEXT("Unknown command: %s"), *Command)));
 			return;
 		}
 		Handler = *Found;
 	}
 
-	// Execute on Game Thread and wait for result
-	// Use TSharedPtr so the lambda and this thread share ownership safely,
-	// preventing use-after-free if the timeout fires before the game thread runs.
-	TSharedPtr<FJsonObject> Result;
-	auto ResultHolder = MakeShared<TSharedPtr<FJsonObject>>();
-	FEvent* DoneEvent = FPlatformProcess::GetSynchEventFromPool(true);
+	// Execute on the game thread and wait. The pending-command object is shared with the task,
+	// so nothing here is touched after this function returns; the state machine decides who
+	// owns the outcome when the wait expires:
+	//   Pending -> Cancelled  : the task had not started; it will return without running.
+	//   Running -> StaleRunning: it is executing; we answer "timeout", mark it stale, and the
+	//                            task itself clears the stale flag when it finishes.
+	TSharedPtr<FMCPPendingCommand> Cmd = MakeShared<FMCPPendingCommand>();
+	TSharedPtr<FStaleState> Stale = StaleState;
 
-	AsyncTask(ENamedThreads::GameThread, [Handler, Params, ResultHolder, DoneEvent]()
+	AsyncTask(ENamedThreads::GameThread, [Handler, Params, Cmd, Stale]()
 	{
-		*ResultHolder = Handler(Params);
-		DoneEvent->Trigger();
+		int32 Expected = FMCPPendingCommand::Pending;
+		if (!Cmd->State.CompareExchange(Expected, FMCPPendingCommand::Running))
+		{
+			return; // cancelled before it ran
+		}
+		Cmd->Result = Handler(Params);
+		Expected = FMCPPendingCommand::Running;
+		if (!Cmd->State.CompareExchange(Expected, FMCPPendingCommand::Finished))
+		{
+			// the socket thread gave up on us: we were the stale command, and it is over now
+			Stale->Running.Decrement();
+		}
+		Cmd->Event->Trigger();
 	});
 
-	bool bCompleted = DoneEvent->Wait(30000);
-	FPlatformProcess::ReturnSynchEventToPool(DoneEvent);
-
-	if (bCompleted && ResultHolder->IsValid())
+	const bool bCompleted = Cmd->Event->Wait(CommandTimeoutMs);
+	TSharedPtr<FJsonObject> Result;
+	if (bCompleted && Cmd->Result.IsValid())
 	{
-		Result = *ResultHolder;
+		Result = Cmd->Result;
+	}
+	else if (bCompleted)
+	{
+		Result = MCPErrorEx(TEXT("handler_failed"), FString::Printf(TEXT("Command '%s' returned no result"), *Command));
 	}
 	else
 	{
-		Result = MCPError(TEXT("Command execution timed out or failed"));
+		int32 Expected = FMCPPendingCommand::Pending;
+		if (Cmd->State.CompareExchange(Expected, FMCPPendingCommand::Cancelled))
+		{
+			Result = MCPErrorEx(TEXT("timeout"),
+				FString::Printf(TEXT("Command '%s' was not started within %d ms (game thread busy); it was cancelled"), *Command, CommandTimeoutMs),
+				TEXT("The editor is stalled or blocked by a modal dialog; retry once it responds"));
+		}
+		else
+		{
+			Stale->Running.Increment();
+			{
+				FScopeLock Lock(&Stale->Mutex);
+				Stale->CommandName = Command;
+			}
+			Expected = FMCPPendingCommand::Running;
+			if (!Cmd->State.CompareExchange(Expected, FMCPPendingCommand::StaleRunning))
+			{
+				Stale->Running.Decrement(); // it finished in the meantime
+			}
+			Result = MCPErrorEx(TEXT("timeout"),
+				FString::Printf(TEXT("Command '%s' is still running after %d ms"), *Command, CommandTimeoutMs),
+				TEXT("Further commands are refused with 'busy' until it finishes"));
+		}
 	}
 
 	SendResponse(ClientSocket, Result);
+}
+
+// ====================================================================================
+// TRANSPORT COMMAND HANDLERS
+// ====================================================================================
+
+void FMCPTcpServer::RegisterTransportHandlers()
+{
+	RegisterHandler(TEXT("ping"), [this](const TSharedPtr<FJsonObject>& Params) { return HandlePing(Params); });
+}
+
+TSharedPtr<FJsonObject> FMCPTcpServer::HandlePing(const TSharedPtr<FJsonObject>& Params)
+{
+	// Connectivity check and transport regression probe: echoes the length of an optional
+	// payload plus its last character, so a client can prove multi-MB and multi-byte UTF-8
+	// lines survive the trip.
+	auto R = MCPSuccess();
+	R->SetStringField(TEXT("reply"), TEXT("pong"));
+	FString Payload;
+	if (Params->TryGetStringField(TEXT("payload"), Payload))
+	{
+		R->SetNumberField(TEXT("payload_length"), Payload.Len());
+		R->SetStringField(TEXT("payload_tail"), Payload.IsEmpty() ? FString() : Payload.Right(1));
+	}
+	return R;
 }
 
 void FMCPTcpServer::SendResponse(FSocket* ClientSocket, const TSharedPtr<FJsonObject>& Response)
@@ -472,7 +645,7 @@ void FMCPTcpServer::SendResponse(FSocket* ClientSocket, const TSharedPtr<FJsonOb
 	int32 BytesSent = 0;
 	ClientSocket->Send((const uint8*)Converter.Get(), Converter.Length(), BytesSent);
 
-	UE_LOG(LogUnrealMCP, Log, TEXT("[UnrealMCP] Sent: %s"), *JsonStr.TrimEnd());
+	UE_LOG(LogUnrealMCP, Log, TEXT("[UnrealMCP] Sent (%d chars): %s"), JsonStr.Len(), *JsonStr.Left(300).TrimEnd());
 }
 
 void FMCPTcpServer::WritePortFile(int32 Port)

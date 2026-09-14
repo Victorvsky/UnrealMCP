@@ -103,3 +103,24 @@ Niagara tools are compiled conditionally. In `UnrealMCP.Build.cs`, set `bEnableN
 
 Copyright (c) 2026 victorvksy. All rights reserved.
 Licensed under the [Fab Standard License (EULA)](https://www.fab.com/eula).
+
+## Testing
+
+- **Python** (no editor needed): `cd Plugins/UnrealMCP && pip install -e "Python[dev]" && pytest Python/tests`.
+  Add `-m live` with the editor running to include the round-trip tests. `test_parity.py`
+  fails when a C++ command has no Python tool or vice versa; `test_content_sync.py` fails when
+  `Content/Python/unreal_mcp` is out of date (`python Python/tools/sync_content.py` regenerates it).
+- **Editor**: Session Frontend -> Automation -> `UnrealMCP.Transport.*`, or in the console
+  `Automation RunTests UnrealMCP.Transport`. Covers connectivity, a 5 MB multi-byte line, the
+  receive cap (`line_too_long`), and timeout isolation (a stalled command answers `timeout`,
+  the next one `busy`, then recovery).
+
+### Running tests: the harness is not hung
+
+When the editor window is in the background it throttles to a few FPS, and the automation
+runner first waits for an "interactive" frame rate of 10 FPS before starting any test. That
+wait gives up after 600 seconds and the tests then run normally. Keep the editor in the
+foreground (or turn off *Use Less CPU when in Background* in Editor Preferences) to skip it.
+A command that blocks the game thread (a modal dialog) makes every further command answer
+`busy` until the dialog is dismissed; that is by design.
+- Errors are structured: `{"error": {"code", "message", "hint"}}`; see `docs/visual-capture/ARCHITECTURE.md`.

@@ -10,7 +10,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 from unreal_mcp.bridge import bridge, BridgeError
-from unreal_mcp.routers import actor, blueprint, level, landscape, material, playtest, editor, component, widget, asset, datatable, niagara, sequencer, widget_animation, blueprint_macro
+from unreal_mcp.routers import actor, blueprint, level, landscape, material, playtest, editor, component, widget, asset, datatable, niagara, sequencer, widget_animation, blueprint_macro, transport
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("unreal-mcp")
@@ -29,6 +29,7 @@ def _register_router(module):
     ALL_HANDLERS.update(module.get_handlers())
 
 
+_register_router(transport)
 _register_router(actor)
 _register_router(blueprint)
 _register_router(level)

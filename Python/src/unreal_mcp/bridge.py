@@ -8,8 +8,40 @@ import os
 from pathlib import Path
 
 
+MAX_LINE_BYTES = 64 * 1024 * 1024
+
+
 class BridgeError(Exception):
     """Raised when the bridge encounters an error."""
+
+
+# Commands that are safe to send twice: read-only queries and the transport probe. Only these
+# are retried automatically after a dropped connection; everything else returns
+# ``connection_lost`` and leaves the retry decision to the caller.
+IDEMPOTENT_PREFIXES = ("ping", "list_", "get_", "find_", "read_", "level_info")
+
+
+def is_idempotent(command: str) -> bool:
+    return command.startswith(IDEMPOTENT_PREFIXES)
+
+
+def normalize_error(response: dict) -> dict:
+    """Flatten a structured error {"error": {code, message, hint}} for the legacy handlers.
+
+    Every transport-level error and every new tool returns the structured shape. The
+    original handlers only ever look at ``response["error"]`` as a string, so the object is
+    kept under ``error_detail`` and ``error`` becomes ``"code: message (hint)"``.
+    """
+    err = response.get("error")
+    if isinstance(err, dict):
+        code = err.get("code", "error")
+        text = f"{code}: {err.get('message', '')}"
+        if err.get("hint"):
+            text += f" ({err['hint']})"
+        response = dict(response)
+        response["error_detail"] = err
+        response["error"] = text
+    return response
 
 
 class UEBridge:
@@ -51,7 +83,12 @@ class UEBridge:
         port = int(port_file.read_text().strip())
 
         try:
-            self._reader, self._writer = await asyncio.open_connection("127.0.0.1", port)
+            # Responses are single JSON lines that can run to tens of MB (screenshots, large
+            # levels); the default 64 KB StreamReader limit made list_blueprints fail on a
+            # mid-size project.
+            self._reader, self._writer = await asyncio.open_connection(
+                "127.0.0.1", port, limit=MAX_LINE_BYTES
+            )
         except ConnectionRefusedError:
             raise BridgeError(
                 f"Connection refused on port {port}. "
@@ -93,9 +130,21 @@ class UEBridge:
 
                 line = await asyncio.wait_for(self._reader.readline(), timeout=60.0)
                 if not line:
-                    # Connection closed, try to reconnect once
+                    # The connection dropped after the write. The command may already have run
+                    # on the game thread, so resending a mutating command could execute it
+                    # twice. Reconnect for the next call, and only auto-retry commands that
+                    # are safe to repeat.
                     await self.disconnect()
                     await self.connect()
+                    if not is_idempotent(command):
+                        return normalize_error({
+                            "success": False,
+                            "error": {
+                                "code": "connection_lost",
+                                "message": f"Connection to UE5 dropped while waiting for '{command}'",
+                                "hint": "The command may or may not have executed; check state before retrying",
+                            },
+                        })
                     self._writer.write(msg.encode("utf-8"))
                     await self._writer.drain()
                     line = await asyncio.wait_for(self._reader.readline(), timeout=60.0)
@@ -103,7 +152,7 @@ class UEBridge:
                         raise BridgeError("Connection closed by UE5")
 
                 response = json.loads(line.decode("utf-8"))
-                return response
+                return normalize_error(response)
 
             except asyncio.TimeoutError:
                 await self.disconnect()

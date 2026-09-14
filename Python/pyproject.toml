@@ -7,6 +7,13 @@ dependencies = [
     "mcp>=1.0.0",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: needs a running Unreal Editor with the UnrealMCP plugin"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/unreal_mcp"]
 
