@@ -30,6 +30,16 @@ The plugin runs a lightweight TCP server inside the editor. A companion Python M
 | **Editor Utilities** | Console commands, save levels, undo/redo, open levels |
 | **Playtesting** | Start/stop PIE, keyboard/mouse input, game state, component function calls via reflection |
 
+## Visual capture
+
+`capture_viewport` returns a frame of the editor viewport, the PIE camera, or any camera you
+specify, as image content plus the state that explains it: camera pose and the visible actors
+with their screen boxes, world positions and distances. Editor and PIE captures read the live
+viewport back, so the image shows exactly what the user sees (Lumen, post process, exposure).
+An agent uses it to check its own edits or to look at what a playtester describes. Reference: `docs/visual-capture/TOOLS.md`;
+design and threading: `docs/visual-capture/ARCHITECTURE.md`. Defaults live in Project Settings
+> Plugins > MCP Capture.
+
 ## Installation
 
 ### 1. UE5 Plugin

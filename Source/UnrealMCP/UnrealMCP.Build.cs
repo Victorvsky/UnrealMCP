@@ -20,8 +20,11 @@ public class UnrealMCP : ModuleRules
 			"InputCore"
 		});
 
+		PrivateIncludePaths.Add(System.IO.Path.Combine(ModuleDirectory, "Private"));
+
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
+			"DeveloperSettings",
 			"UnrealEd",
 			"BlueprintGraph",
 			"KismetCompiler",

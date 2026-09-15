@@ -5,9 +5,13 @@
     pytest -m live Python/tests
 """
 
+import base64
+
 import pytest
 
 pytestmark = pytest.mark.live
+
+JPEG_MAGIC = b"\xff\xd8\xff"
 
 
 def test_ping(live_call):
@@ -35,3 +39,22 @@ def test_large_response_survives_the_reader_limit(live_call):
     # list_blueprints on a mid-size project is well over the old 64 KB default.
     resp = live_call("list_blueprints")
     assert "error" not in resp, str(resp)[:300]
+
+
+def test_capture_editor_frame(live_call):
+    resp = live_call("capture_viewport", {"camera": "editor", "resolution": {"w": 320, "h": 180}})
+    assert resp.get("success") is True, str(resp)[:300]
+    img = resp["image"]
+    # Aspect-preserving fit of the viewport into the request: one edge hits the bound.
+    w, h = img["width"], img["height"]
+    assert 16 <= w <= 320 and 16 <= h <= 180 and (w == 320 or h == 180), (w, h)
+    assert base64.b64decode(img["data"])[:3] == JPEG_MAGIC
+    assert isinstance(resp["actors"], list) and "camera" in resp
+
+
+def test_capture_pie_without_pie_is_a_structured_error(live_call):
+    status = live_call("get_pie_status")
+    if status.get("is_playing"):
+        pytest.skip("PIE is running; the no-PIE path cannot be tested now")
+    resp = live_call("capture_viewport", {"camera": "pie"})
+    assert resp["error_detail"]["code"] == "pie_not_running", resp

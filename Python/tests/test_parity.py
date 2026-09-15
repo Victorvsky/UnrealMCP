@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 
 PLUGIN = Path(__file__).resolve().parents[2]
-CPP = PLUGIN / "Source" / "UnrealMCP" / "Private" / "MCPTcpServer.cpp"
+CPP_DIR = PLUGIN / "Source" / "UnrealMCP" / "Private"
 ROUTERS = PLUGIN / "Python" / "src" / "unreal_mcp" / "routers"
 
 # Commands the plugin registers for its own use, with no MCP tool on purpose.
@@ -18,7 +18,14 @@ INTERNAL_COMMANDS: set[str] = set()
 
 
 def cpp_commands() -> set[str]:
-    return set(re.findall(r'RegisterHandler\(TEXT\("([a-z0-9_]+)"\)', CPP.read_text(encoding="utf-8")))
+    # Handlers register from several files (MCPTcpServer.cpp, Capture/...); tests register
+    # throwaway "__test_*" commands at runtime and are excluded.
+    out = set()
+    for f in CPP_DIR.rglob("*.cpp"):
+        if "Tests" in f.parts:
+            continue
+        out |= set(re.findall(r'RegisterHandler\(TEXT\("([a-z0-9_]+)"\)', f.read_text(encoding="utf-8")))
+    return out
 
 
 def python_commands() -> set[str]:
