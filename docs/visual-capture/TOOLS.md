@@ -17,8 +17,8 @@ the state follows as a JSON text block.
 | `resolution` | `{w, h}` | `1024x576` (Project Settings > Plugins > MCP Capture) | longest edge capped by `MaxLongEdge` (2048) |
 | `format` | `"jpeg"` \| `"png"` | `"jpeg"` | |
 | `quality` | 1-100 | 80 | JPEG only |
-| `max_actors` | int | 200 | nearest first |
-| `debug` | bool | false | also return `culled`: `[{name, reason}]` with `no_rendered_mesh`, `behind_camera`, `off_screen`, `occluded_by:<actor>` |
+| `max_actors` | int, 0-2000 | 200 | bounds the list and the occlusion traces: the `max_actors` largest on-screen boxes are traced, the rest are `over_limit`; values above 2000 are clamped; 0 lists nothing (with `debug`, every candidate is `over_limit`) |
+| `debug` | bool | false | also return `culled`: `[{name, reason}]` with `no_rendered_mesh`, `behind_camera`, `off_screen`, `over_limit`, `occluded_by:<actor>` |
 
 **Output** (the JSON text block; the image travels separately)
 
@@ -37,7 +37,11 @@ the state follows as a JSON text block.
 
 `actors` lists actors whose rendered mesh bounds project into the image and are not hidden
 behind something else (one line trace to the bounds centre; a partly hidden actor still
-counts as visible). Volumes, info actors, brushes and the per-map foliage actor are skipped.
+counts as visible). The traces are bounded by `max_actors`: candidates are ordered by
+on-screen box area and only the first `max_actors` are traced, so the trace count follows
+the request, not the level. The projection pass still visits every actor in the level (about
+1 us each; see Measured below). The list itself is nearest first. Volumes, info actors,
+brushes and the per-map foliage actor are skipped.
 `screen_bbox` is `[x0, y0, x1, y1]` in pixels, clamped to the image. Large actors such as the
 landscape or a skybox legitimately cover the whole frame.
 
@@ -68,7 +72,9 @@ resize, JPEG/PNG encoding and base64 run on the socket thread after the handler 
 
 **Measured** (UE 5.7, 391-actor level, loopback client): game-thread part 9-13 ms for a
 viewport readback (editor: plus the on-demand draw, 190 ms on the first call), 55-160 ms for a
-scene capture (two renders plus readback); visible-actor pass under 1 ms; resize plus encode
-about 10 ms. End to end the call waits for the next editor frame, so the round trip is bounded
+scene capture (two renders plus readback); visible-actor pass 0.7-1.3 ms on the 391-actor main
+level (375 actors considered, at most 200 traces at the default cap) and 1.9-2.5 ms on a
+1,721-actor level, where the per-actor projection pass dominates (about 1.1 us per actor)
+and the traces stay capped; resize plus encode about 10 ms. End to end the call waits for the next editor frame, so the round trip is bounded
 by the editor's frame rate: 40-80 ms at interactive rates, 330 ms when the editor is throttled
 to 3 FPS in the background.

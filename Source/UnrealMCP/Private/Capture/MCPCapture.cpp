@@ -239,12 +239,25 @@ TArray<MCPCapture::FVisibleActor> MCPCapture::FindVisibleActors(const FView& Vie
 	auto Cull = [OutCulled](const AActor* A, const FString& Why) { if (OutCulled) { OutCulled->Add({ A->GetActorNameOrLabel(), Why }); } };
 	check(IsInGameThread());
 	TArray<FVisibleActor> Out;
-	if (!View.World || MaxActors <= 0)
+	if (!View.World || (MaxActors <= 0 && !OutCulled))
 	{
-		return Out;
+		return Out; // nothing to list and nobody asking why: skip the pass entirely
 	}
 	const bool bGameWorld = View.World->IsGameWorld();
 	const FMatrix VP = ViewProjection(View, Width, Height);
+
+	// Pass 1 (O(actors), no world queries): bounds, projection, frustum. Everything that lands in
+	// the image becomes a candidate for the occlusion trace in pass 2.
+	struct FCandidate
+	{
+		AActor* Actor = nullptr;
+		FBox Bounds;
+		FIntRect Box;
+		double Distance = 0.0;
+		int64 Area = 0;
+	};
+	TArray<FCandidate> Candidates;
+	Candidates.Reserve(256);
 
 	for (TActorIterator<AActor> It(View.World); It; ++It)
 	{
@@ -304,36 +317,57 @@ TArray<MCPCapture::FVisibleActor> MCPCapture::FindVisibleActors(const FView& Vie
 			continue;
 		}
 
-		// Cheap occlusion: a single trace to the bounds centre. Occluded only if something else
-		// is hit before the ray reaches the actor's bounds (a hit inside the slightly expanded
-		// box counts as reaching it: small props sit on or in the ground, and the ground is
-		// what the ray touches first).
-		const double Distance = FVector::Dist(View.Location, Origin);
+		FCandidate& Candidate = Candidates.AddDefaulted_GetRef();
+		Candidate.Actor = Actor;
+		Candidate.Bounds = Bounds;
+		Candidate.Box = Box;
+		Candidate.Distance = FVector::Dist(View.Location, Origin);
+		Candidate.Area = static_cast<int64>(Box.Width()) * Box.Height();
+	}
+
+	// Pass 2: occlusion, one line trace per actor. The trace count is bounded by MaxActors, not
+	// by the level: the candidates with the largest on-screen boxes are traced and the rest are
+	// culled as over_limit without a trace. Largest first rather than nearest first, because a
+	// distant house that fills the frame matters more than a pebble at the camera's feet.
+	Candidates.Sort([](const FCandidate& A, const FCandidate& B)
+	{
+		return A.Area != B.Area ? A.Area > B.Area : A.Distance < B.Distance;
+	});
+	FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(MCPCaptureVisibility), true);
+	for (int32 Index = 0; Index < Candidates.Num(); ++Index)
+	{
+		const FCandidate& Candidate = Candidates[Index];
+		if (Index >= MaxActors)
+		{
+			Cull(Candidate.Actor, TEXT("over_limit"));
+			continue;
+		}
+		// A single trace to the bounds centre. Occluded only if something else is hit before
+		// the ray reaches the actor's bounds (a hit inside the slightly expanded box counts as
+		// reaching it: small props sit on or in the ground, and the ground is what the ray
+		// touches first).
+		const FVector Origin = Candidate.Bounds.GetCenter();
+		const FVector Extent = Candidate.Bounds.GetExtent();
 		FHitResult Hit;
-		FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(MCPCaptureVisibility), true);
 		if (View.World->LineTraceSingleByChannel(Hit, View.Location, Origin, ECC_Visibility, QueryParams))
 		{
-			const bool bReachedBounds = Bounds.ExpandBy(FMath::Max(10.0, Extent.Size() * 0.25)).IsInside(Hit.ImpactPoint);
-			if (Hit.GetActor() != Actor && !bReachedBounds && Hit.Distance < Distance - Extent.Size())
+			const bool bReachedBounds = Candidate.Bounds.ExpandBy(FMath::Max(10.0, Extent.Size() * 0.25)).IsInside(Hit.ImpactPoint);
+			if (Hit.GetActor() != Candidate.Actor && !bReachedBounds && Hit.Distance < Candidate.Distance - Extent.Size())
 			{
-				Cull(Actor, FString::Printf(TEXT("occluded_by:%s"), Hit.GetActor() ? *Hit.GetActor()->GetActorNameOrLabel() : TEXT("?")));
+				Cull(Candidate.Actor, FString::Printf(TEXT("occluded_by:%s"), Hit.GetActor() ? *Hit.GetActor()->GetActorNameOrLabel() : TEXT("?")));
 				continue;
 			}
 		}
 
 		FVisibleActor V;
-		V.Name = Actor->GetActorNameOrLabel();
-		V.Class = Actor->GetClass()->GetName();
-		V.WorldLocation = Actor->GetActorLocation();
-		V.Distance = Distance;
-		V.ScreenBox = Box;
+		V.Name = Candidate.Actor->GetActorNameOrLabel();
+		V.Class = Candidate.Actor->GetClass()->GetName();
+		V.WorldLocation = Candidate.Actor->GetActorLocation();
+		V.Distance = Candidate.Distance;
+		V.ScreenBox = Candidate.Box;
 		Out.Add(MoveTemp(V));
 	}
 	Out.Sort([](const FVisibleActor& A, const FVisibleActor& B) { return A.Distance < B.Distance; });
-	if (Out.Num() > MaxActors)
-	{
-		Out.SetNum(MaxActors);
-	}
 	return Out;
 }
 
@@ -466,10 +500,7 @@ namespace
 				TEXT("The renderer may not be ready; retry once the editor has drawn a frame"));
 		}
 		}
-		for (FColor& C : Pixels)
-		{
-			C.A = 255; // alpha is scene-dependent in both paths; the image is opaque by definition
-		}
+		// (alpha is scene-dependent in both paths; the post-process lambda makes the image opaque)
 
 		// --- state that explains the frame (game thread, cheap)
 		const bool bDebug = Params->HasField(TEXT("debug")) && Params->GetBoolField(TEXT("debug"));
@@ -566,6 +597,10 @@ namespace
 					}
 				}
 				Pixels = MoveTemp(Resized);
+			}
+			for (FColor& C : Pixels)
+			{
+				C.A = 255; // the image is opaque by definition
 			}
 			IImageWrapperModule& Module = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
 			TSharedPtr<IImageWrapper> Wrapper = Module.CreateImageWrapper(Format == TEXT("png") ? EImageFormat::PNG : EImageFormat::JPEG);

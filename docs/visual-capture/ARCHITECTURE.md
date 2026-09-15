@@ -107,7 +107,7 @@ Where each step of a capture runs, and why:
 |---|---|---|
 | choose camera; for `"editor"`/`"pie"` draw the live viewport on demand (editor) and read it back with `FViewport::ReadPixels`; for explicit cameras spawn a transient `USceneCaptureComponent2D` and `CaptureScene()` | game | engine requirement: viewports, scene components and scene capture are game-thread APIs. The live viewport is read (not re-rendered through a scene capture) because it is the only path that carries every feature the user sees; a scene capture of the same camera measured 13x darker on a night scene |
 | pixel readback (`FViewport::ReadPixels` / `FRenderTarget::ReadPixels`) | game thread, blocking on the render thread | the readback flushes rendering commands and copies the frame back; it is the one unavoidable stall (9-13 ms for a viewport frame, 55-160 ms for a scene capture; reported in the Phase 1 PR) and it keeps the pixel buffer's lifetime trivial |
-| project actor bounds, occlusion line traces | game | world queries are game-thread only; this is cheap (hundreds of actors) |
+| project actor bounds, occlusion line traces | game | world queries are game-thread only. Projection is O(actors) and cheap (about 1 us per actor); the line traces are bounded by `max_actors` (largest on-screen boxes first, the rest culled as `over_limit`), so the trace cost follows the request while the projection pass remains O(actors) |
 | resize to the requested size, JPEG/PNG encode, base64, JSON assembly | **socket thread**, after the game-thread part has returned | the socket thread already exists per command and is not the game thread; no thread pool, no extra copies |
 
 Mechanism: a handler running on the game thread may call
@@ -119,7 +119,37 @@ is exactly: trigger, read back, hand off. `check(IsInGameThread())` guards the c
 `check(!IsInGameThread())` guards the post-process path.
 
 Not chosen: a separate encode thread pool (nothing to gain while the transport is single-client
-and one command is in flight at a time); an async render-thread readback (`FRHIGPUTextureReadback`)
-would remove the flush but needs the command to span frames, which the current one-shot handler
-model does not support. Both are candidates for Phase 2 if the per-frame recording cost exceeds
-the 3 ms budget.
+and one command is in flight at a time). The synchronous readback is accepted for one-shot
+captures only; see the Phase 2 decisions below.
+
+## Phase 2 decisions (recorded before the recording code)
+
+Two Phase 1 shortcuts are right for a one-shot capture and wrong for a recorder. They are the
+plan, not open questions:
+
+1. **The readback never blocks the game thread.** `FViewport::ReadPixels` and
+   `FRenderTarget::ReadPixels` flush the render thread and copy synchronously: 9-13 ms per
+   viewport frame (55-160 ms for a scene capture). At 10 fps that is 100+ ms of game-thread
+   stall per second, hitching the very PIE session being recorded. The recorder uses
+   `FRHIGPUTextureReadback` with a one-frame delay: on frame N a render command enqueues a copy
+   of the frame into the readback's staging texture; on frame N+1 (or whenever `IsReady()`
+   first reports true) a render command locks the staging texture, copies the pixels out and
+   unlocks (`Lock`/`Unlock` are render-thread calls), then posts the buffer to the session's
+   own encode worker: one `FRunnableThread` per recording session that encodes and writes
+   under `Saved/MCPRecordings/<session>/`. `QueuePostProcess` is not usable here: it belongs
+   to the one command in flight, and a recording outlives its command. The price is one frame
+   of latency between the sampled game state and the image; the timeline stores the frame's
+   own world time, so nothing is misattributed. Lowering the recording fps cap is not an
+   acceptable substitute: it hides the stall instead of removing it.
+2. **Frames come from the live PIE viewport; one pooled set of capture objects per session.**
+   The Phase 1 finding stands for recording: the PIE viewport's render target is the only
+   source that carries what the player sees, so `record_pie` reads that texture through the
+   session's `FRHIGPUTextureReadback` (double-buffered so frame N+1 can be enqueued while
+   frame N is copied out). Only a recording of a camera other than the PIE viewport (not in
+   the Phase 2 contract, but the path exists for explicit-camera captures) renders through a
+   scene capture; `capture_viewport` allocates a `USceneCaptureComponent2D` and a render
+   target for every explicit-camera call and marks both as garbage after the readback, which
+   is fine once and not ten times a second. A recording session therefore owns its readback
+   objects and, when it needs one, one scene-capture component + render target, all created
+   by `record_pie` and released by `stop_recording`, the PIE-end delegate or module shutdown,
+   whichever comes first.

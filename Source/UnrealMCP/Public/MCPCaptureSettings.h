@@ -35,7 +35,7 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Capture", meta = (ClampMin = 64, ClampMax = 8192))
 	int32 MaxLongEdge = 2048;
 
-	/** Most actors listed per capture (nearest first). */
+	/** Cap on the visible-actor list and on the occlusion line traces per capture: the largest on-screen boxes are traced, the rest are culled as over_limit. The returned list is nearest first. */
 	UPROPERTY(config, EditAnywhere, Category = "Capture", meta = (ClampMin = 0, ClampMax = 2000))
 	int32 MaxActors = 200;
 

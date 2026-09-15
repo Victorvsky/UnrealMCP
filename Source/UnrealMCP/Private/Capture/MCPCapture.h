@@ -49,11 +49,14 @@ namespace MCPCapture
 	struct FCulledActor
 	{
 		FString Name;
-		FString Reason; // no_rendered_mesh | behind_camera | off_screen | occluded_by:<actor>
+		FString Reason; // no_rendered_mesh | behind_camera | off_screen | over_limit | occluded_by:<actor>
 	};
 
 	/** Actors whose bounds project into a Width x Height image seen from View, nearest first.
 	 *  Off-screen actors are culled; a line trace to the bounds centre culls the fully occluded.
-	 *  OutCulled, when given, receives every skipped actor with the reason. */
+	 *  At most MaxActors traces run (the largest on-screen boxes first); further candidates are
+	 *  culled as over_limit without a trace, so the trace count is bounded by the request, not
+	 *  the level (the projection pass still visits every actor). OutCulled, when given, receives
+	 *  every skipped actor with the reason; with MaxActors 0 that is every candidate. */
 	TArray<FVisibleActor> FindVisibleActors(const FView& View, int32 Width, int32 Height, int32 MaxActors, TArray<FCulledActor>* OutCulled = nullptr);
 }

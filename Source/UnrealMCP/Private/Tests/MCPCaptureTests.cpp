@@ -177,7 +177,7 @@ bool FMCPCaptureVisibleActorsTest::RunTest(const FString& Parameters)
 
 	View.Location = Origin - FVector(Back, 0, 0);
 	View.Rotation = FRotator::ZeroRotator; // looking down +X at the subject
-	TArray<MCPCapture::FVisibleActor> InFront = MCPCapture::FindVisibleActors(View, 640, 360, 500);
+	TArray<MCPCapture::FVisibleActor> InFront = MCPCapture::FindVisibleActors(View, 640, 360, TNumericLimits<int32>::Max()); // uncapped: this asserts projection/occlusion only
 	const MCPCapture::FVisibleActor* Found = InFront.FindByPredicate([&](const MCPCapture::FVisibleActor& A) { return A.Name == Subject->GetActorNameOrLabel(); });
 	if (!Found)
 	{
@@ -188,8 +188,21 @@ bool FMCPCaptureVisibleActorsTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("box is inside the image"), Found->ScreenBox.Min.X >= 0 && Found->ScreenBox.Max.X <= 640 && Found->ScreenBox.Min.Y >= 0 && Found->ScreenBox.Max.Y <= 360);
 	TestTrue(TEXT("nearest first"), InFront[0].Distance <= Found->Distance);
 
+	// The occlusion traces are bounded by MaxActors: with a cap of 1, at most one actor is
+	// listed, at most one trace ran (listed + occluded), and the other candidates are reported
+	// as over_limit.
+	TArray<MCPCapture::FCulledActor> Culled;
+	TArray<MCPCapture::FVisibleActor> Capped = MCPCapture::FindVisibleActors(View, 640, 360, 1, &Culled);
+	TestTrue(TEXT("max_actors caps the list"), Capped.Num() <= 1);
+	if (InFront.Num() > 1)
+	{
+		const int32 Traced = Capped.Num() + Culled.FilterByPredicate([](const MCPCapture::FCulledActor& C) { return C.Reason.StartsWith(TEXT("occluded_by:")); }).Num();
+		TestTrue(TEXT("at most MaxActors traces"), Traced <= 1);
+		TestTrue(TEXT("candidates beyond the cap are culled as over_limit"), Culled.ContainsByPredicate([](const MCPCapture::FCulledActor& C) { return C.Reason == TEXT("over_limit"); }));
+	}
+
 	View.Rotation = FRotator(0, 180, 0); // looking away from it
-	TArray<MCPCapture::FVisibleActor> Behind = MCPCapture::FindVisibleActors(View, 640, 360, 500);
+	TArray<MCPCapture::FVisibleActor> Behind = MCPCapture::FindVisibleActors(View, 640, 360, TNumericLimits<int32>::Max());
 	TestNull(TEXT("actor behind the camera is culled"), Behind.FindByPredicate([&](const MCPCapture::FVisibleActor& A) { return A.Name == Subject->GetActorNameOrLabel(); }));
 	return true;
 }
