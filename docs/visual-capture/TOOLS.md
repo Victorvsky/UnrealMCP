@@ -78,3 +78,123 @@ level (375 actors considered, at most 200 traces at the default cap) and 1.9-2.5
 and the traces stay capped; resize plus encode about 10 ms. End to end the call waits for the next editor frame, so the round trip is bounded
 by the editor's frame rate: 40-80 ms at interactive rates, 330 ms when the editor is throttled
 to 3 FPS in the background.
+
+## `record_pie`
+
+Starts recording the Play-In-Editor session and returns at once with a session id. The session
+ends on its own after `duration_s` seconds of world time, when PIE ends, or on `stop_recording`.
+One session records at a time (`recording_in_progress` otherwise).
+
+**Input**
+
+| field | type | default | notes |
+|---|---|---|---|
+| `duration_s` | 0-120 | 30 | world time, not wall time |
+| `fps` | 0-10 | 2 | frames per second of world time |
+| `resolution` | `{w, h}` | Project Settings default | bounding box; the viewport aspect ratio is kept, longest edge capped by `MaxLongEdge` |
+| `actor_filter` | string[] | pawns + actors tagged `MCPTrack` | class names (any ancestor) or actor tags to track for actor events |
+| `start_pie` | bool | true | start PIE when none runs; a session the tool starts runs with a fixed 1/30 s time step and a fixed random seed so two runs are comparable |
+| `quality` | 1-100 | Project Settings JPEG quality | |
+
+**Output**
+
+```json
+{"session_id": "20260915-190612-3f9a1c", "state": "recording",      // "starting" while PIE boots
+ "manifest_uri": "file:///F:/Eruin/Saved/MCPRecordings/20260915-190612-3f9a1c/manifest.json",
+ "started_pie": false, "duration_s": 30, "fps": 2, "dir": "F:/Eruin/Saved/MCPRecordings/20260915-190612-3f9a1c"}
+```
+
+**Storage** (`Saved/<StoragePath>/<session>/`, StoragePath defaults to `MCPRecordings`,
+sessions older than `RetentionDays` are pruned when the plugin starts):
+
+| file | content |
+|---|---|
+| `manifest.json` | state, counts, timings, level, resolution; rewritten after every frame, so it is always valid |
+| `frames/NNNNNN.jpg` | one JPEG per captured frame |
+| `frames.jsonl` | one record per frame: `{index, t, world_time, file, width, height, bytes, actors:[...]}` |
+| `timeline.jsonl` | `{t, kind: "log"|"actor"|"stats", ...}` records in the order they happened |
+
+`t` is seconds since the recording started; `world_time` is the PIE world clock. Every record
+carries the world time of the frame it belongs to: the image copied on tick N is frame N-1's
+render, and the actor sample taken at the start of tick N is frame N-1's world state, so the
+two agree. The manifest is also exposed as an MCP resource (`file:///...manifest.json`).
+
+**Errors:** `recording_in_progress` (with `session_id`), `pie_not_running` (only with
+`start_pie: false`), `invalid_duration`, `invalid_fps`, `invalid_resolution`,
+`resolution_too_large`, `storage_failed`.
+
+## `get_recording_status`
+
+`{session_id?}` -> the manifest, live from memory for the running session (`active: true`) or
+from disk otherwise. Fields: `state` (`starting` | `recording` | `finished`), `end_reason`
+(`duration` | `stopped` | `pie_ended` | `shutdown` | `failed`), `frames`, `dropped_frames`,
+`warnings`, `errors`, `log_lines`, `actor_events`, `recorded_s`, `source_format` (the
+viewport's pixel format, `sync:...` when the synchronous fallback had to be used),
+`timings.game_thread_ms_avg` / `game_thread_ms_max` (the per-captured-frame cost of the
+game-thread part: enqueue + actor sample), `timings.worker_encode_ms_avg`, `notes` (dropped
+frame reasons and other one-line diagnostics). Without `session_id`: the running session, else
+the last one of this editor run. Errors: `session_not_found`, `invalid_session`.
+
+## `stop_recording`
+
+`{session_id?}` -> the final manifest of the running session. `not_recording` for a session
+that already finished (its manifest is on disk; use `get_recording_status`).
+
+## `get_recording_frames`
+
+`{session_id, start_s?, end_s?, fps?, max_frames?}`. Grid points `start_s + k / fps` up to
+`end_s` (default: everything recorded so far), each matched to the nearest unused recorded
+frame within half a grid interval; the others come back `available: false`. `fps` defaults to
+the recorded rate, so the default call returns every recorded frame in the window. `max_frames`
+(default 8, max 32) caps the grid and `truncated` reports when the window had more. Works on a
+session that is still recording: frames land on disk as the worker finishes them.
+
+```json
+{"session_id": "...", "recorded_fps": 2, "requested_fps": 4, "start_s": 0, "end_s": 1, "available": 3, "truncated": false,
+ "frames": [
+   {"t": 0.0,  "available": true, "index": 0, "recorded_t": 0.0, "world_time": 12.5,
+    "image": {"format": "jpeg", "mime_type": "image/jpeg", "width": 1024, "height": 347, "bytes": 41210, "data": "..."},
+    "actors": [{"name": "BP_Alder", "class": "BP_Alder_C", "screen_bbox": [..], "world_location": {..}, "distance": 512.0}]},
+   {"t": 0.25, "available": false, "reason": "not available: no recorded frame near this time"}
+ ]}
+```
+
+The Python server returns a header text block (the grid, with which points are available), then
+for every available frame an image followed by its state as JSON text.
+
+## `get_recording_timeline`
+
+`{session_id, start_s?, end_s?}` ->
+
+```json
+{"log":          [{"t": 3.2, "verbosity": "Warning", "category": "LogTemp", "message": "..."}],
+ "actor_events": [{"t": 3.5, "actor": "BP_Alder", "event": "moved", "detail": {"from": {..}, "to": {..}, "distance": 42.0, "yaw": 90}}],
+ "stats":        [{"t": 3.5, "fps": 58.1, "frame_ms": 17.2, "draw_calls": 1820}],
+ "truncated":    {"log": false, "actor_events": false, "stats": false}}
+```
+
+Log lines are captured at verbosity Log and above (Verbose and VeryVerbose are not), minus the
+plugin's own transport chatter; the first 20,000 lines of a session are kept. Actor events:
+`tracked` (present at the first sample), `spawned`, `destroyed`, `moved` (more than 10 units or
+2 degrees since the last sample), `state_changed` (a Blueprint-visible bool or number on the
+actor changed; found through reflection, nothing game-specific; at most 32 properties per
+actor, 8 changes per sample). Stats are sampled at the recording rate. Caps per query: 2,000
+log lines, 2,000 actor events, 4,000 stats records, each with its own `truncated` flag.
+
+**How it records.** A game-thread ticker enqueues a GPU copy of the PIE viewport's render
+target into an `FRHIGPUTextureReadback` (two in flight) and samples actors; on later frames a
+render command copies out the readbacks that are ready (never waiting); a per-session worker
+thread converts, resizes, encodes and writes. The game thread never waits for the GPU or the
+disk, so the per-frame cost is the enqueue plus the actor sample. If the viewport has no
+separate render target (it draws straight into the window), frames fall back to a synchronous
+readback and the manifest says so in `notes` and `source_format`.
+
+**Measured** (UE 5.7, Eruin's main level, PIE in the editor's 2.96:1 level viewport, editor in the foreground):
+
+| | |
+|---|---|
+| game-thread cost per captured frame (enqueue the GPU copy, project visible actors, sample tracked actors, stats record) | 0.69 ms avg / 0.88 ms max at 2 fps with a 320x180 request; 0.79 ms avg / 0.89 ms max at 2 fps with the default 1024x576 request |
+| dropped frames | 0 of 8, 0 of 12 |
+| worker thread per frame (10-bit to BGRA, resize, JPEG, write) | 11.2 ms for 320x108 output, 13.5 ms for 1024x347 output; not on the game thread |
+| viewport render target format | `A2B10G10R10` (the editor's default back buffer), converted on the worker |
+| acceptance (< 3 ms per frame on the game thread at 2 fps, 1024x576) | met at 0.79 ms |

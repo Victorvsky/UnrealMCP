@@ -58,3 +58,14 @@ def test_capture_pie_without_pie_is_a_structured_error(live_call):
         pytest.skip("PIE is running; the no-PIE path cannot be tested now")
     resp = live_call("capture_viewport", {"camera": "pie"})
     assert resp["error_detail"]["code"] == "pie_not_running", resp
+
+
+def test_recording_errors_without_a_session(live_call):
+    status = live_call("get_pie_status")
+    if not status.get("is_playing"):
+        resp = live_call("record_pie", {"start_pie": False})
+        assert resp["error_detail"]["code"] == "pie_not_running", resp
+    resp = live_call("get_recording_status", {"session_id": "nope-000000"})
+    assert resp["error_detail"]["code"] == "session_not_found", resp
+    resp = live_call("get_recording_frames", {"session_id": "../escape"})
+    assert resp["error_detail"]["code"] == "invalid_session", resp

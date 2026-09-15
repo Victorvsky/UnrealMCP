@@ -52,6 +52,23 @@ namespace MCPCapture
 		FString Reason; // no_rendered_mesh | behind_camera | off_screen | over_limit | occluded_by:<actor>
 	};
 
+	/** Structured error object: {"success": false, "error": {code, message, hint}}. */
+	TSharedPtr<FJsonObject> MakeError(const FString& Code, const FString& Message, const FString& Hint = FString());
+
+	/** The PIE player's view (camera, world, viewport). Returns an error object when there is no
+	 *  PIE session or player yet, null on success. Game thread. */
+	TSharedPtr<FJsonObject> ResolvePIEView(FView& Out);
+
+	/** Shrinks a requested size to the source's aspect ratio (both edges stay >= 16). */
+	void FitSize(int32 SrcW, int32 SrcH, int32& InOutW, int32& InOutH);
+
+	/** Box-filter resize in place (a no-op when the sizes match) that also makes the buffer
+	 *  opaque. Any thread. */
+	void BoxResize(TArray<FColor>& Pixels, int32 SrcW, int32 SrcH, int32 DstW, int32 DstH);
+
+	/** JPEG ("jpeg", Quality 1-100) or PNG ("png") encode of a BGRA buffer. Any thread. */
+	bool EncodeImage(const TArray<FColor>& Pixels, int32 Width, int32 Height, const FString& Format, int32 Quality, TArray64<uint8>& OutBytes);
+
 	/** Actors whose bounds project into a Width x Height image seen from View, nearest first.
 	 *  Off-screen actors are culled; a line trace to the bounds centre culls the fully occluded.
 	 *  At most MaxActors traces run (the largest on-screen boxes first); further candidates are

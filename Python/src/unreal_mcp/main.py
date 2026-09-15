@@ -7,10 +7,10 @@ import logging
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent, ImageContent
+from mcp.types import Tool, TextContent, ImageContent, Resource
 
 from unreal_mcp.bridge import bridge, BridgeError
-from unreal_mcp.routers import actor, blueprint, level, landscape, material, playtest, editor, component, widget, asset, datatable, niagara, sequencer, widget_animation, blueprint_macro, transport, capture
+from unreal_mcp.routers import actor, blueprint, level, landscape, material, playtest, editor, component, widget, asset, datatable, niagara, sequencer, widget_animation, blueprint_macro, transport, capture, recording
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("unreal-mcp")
@@ -31,6 +31,7 @@ def _register_router(module):
 
 _register_router(transport)
 _register_router(capture)
+_register_router(recording)
 _register_router(actor)
 _register_router(blueprint)
 _register_router(level)
@@ -51,6 +52,20 @@ _register_router(blueprint_macro)
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     return list(ALL_TOOLS.values())
+
+
+@server.list_resources()
+async def list_resources() -> list[Resource]:
+    """Recording manifests (Saved/MCPRecordings/<session>/manifest.json) as resources."""
+    return [Resource(uri=m["uri"], name=m["name"], mimeType=m["mimeType"]) for m in recording.list_manifests()]
+
+
+@server.read_resource()
+async def read_resource(uri) -> str:
+    text = recording.read_manifest(str(uri))
+    if text is None:
+        raise ValueError(f"Unknown resource: {uri}")
+    return text
 
 
 @server.call_tool()
