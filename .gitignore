@@ -12,3 +12,4 @@ Python/src/unreal_mcp/routers/__pycache__/
 *.egg-info/
 dist/
 build/
+Python/uv.lock

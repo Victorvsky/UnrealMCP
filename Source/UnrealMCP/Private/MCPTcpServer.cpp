@@ -144,6 +144,7 @@
 #include "Misc/Base64.h"
 #include "Templates/Atomic.h"
 #include "Capture/MCPCapture.h"
+#include "Capture/MCPRecording.h"
 #include "HAL/ThreadSafeCounter.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Rendering/RenderingCommon.h"
@@ -290,6 +291,7 @@ bool FMCPTcpServer::Start()
 	StaleState = MakeShared<FStaleState>();
 	RegisterTransportHandlers();
 	MCPCapture::RegisterHandlers(*this);
+	MCPRecording::RegisterHandlers(*this);
 	RegisterActorHandlers();
 	RegisterBlueprintHandlers();
 	RegisterLevelHandlers();
@@ -341,6 +343,7 @@ bool FMCPTcpServer::Start()
 
 void FMCPTcpServer::Stop()
 {
+	MCPRecording::Shutdown();
 	bRunning = false;
 
 	if (ListenerSocket)

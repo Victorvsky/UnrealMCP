@@ -4,7 +4,7 @@ version = "1.0.0"
 description = "MCP server for controlling Unreal Editor via the UnrealMCP plugin — 90+ automation tools for AI agents"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp>=1.0.0",
+    "mcp>=1.0.0,<2",  # the low-level Server API this package uses changed in mcp 2.x
 ]
 
 [project.optional-dependencies]

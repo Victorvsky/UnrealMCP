@@ -37,6 +37,7 @@ public class UnrealMCP : ModuleRules
 			"LevelEditor",
 			"ImageWrapper",
 			"RenderCore",
+			"RHI",
 			"UMG",
 			"UMGEditor",
 			"AssetTools",

@@ -153,3 +153,43 @@ plan, not open questions:
    objects and, when it needs one, one scene-capture component + render target, all created
    by `record_pie` and released by `stop_recording`, the PIE-end delegate or module shutdown,
    whichever comes first.
+
+## Phase 2 implementation notes (record_pie)
+
+Files: `Source/UnrealMCP/Private/Capture/MCPRecording.{h,cpp}` (one session class, a recorder
+that holds at most one running session, five handlers), `Python/src/unreal_mcp/routers/recording.py`.
+
+Pipeline for one recorded frame, and which thread does what:
+
+| step | thread | notes |
+|---|---|---|
+| decide it is time (world-time grid `start + k / fps`), read the PIE viewport's render target texture, enqueue a GPU copy into an `FRHIGPUTextureReadback`, project the visible actors, sample tracked actors, push a stats record | game (a core `FTSTicker`, runs before the world ticks) | this is the whole game-thread cost; measured as `timings.game_thread_ms_*` in the manifest |
+| copy the texture into the readback's staging texture (`Transition` to CopySrc, `EnqueueCopy`, back to SRVMask) | render | enqueued by the ticker, runs after the previous frame's rendering |
+| poll: for every readback whose fence is signalled, `Lock`, copy the rows out (pitch stripped, still in the viewport's pixel format), `Unlock`, hand the bytes to the worker | render (a second render command, enqueued every engine frame while a copy is in flight) | never waits; two readbacks alternate so a slow GPU delays a frame instead of stalling the game thread; a third capture while both are in flight is dropped and counted |
+| convert to BGRA (B8G8R8A8, R8G8B8A8, A2B10G10R10, FloatRGBA), aspect-fit resize, JPEG encode, write `frames/NNNNNN.jpg`, append the frame record to `frames.jsonl`, rewrite `manifest.json` atomically | session worker (`FRunnableThread`, below-normal priority) | the same worker appends the timeline records; the manifest is rewritten after every drained batch so a session killed at any moment stays valid |
+| `get_recording_frames` / `get_recording_timeline` / on-disk `get_recording_status` | socket thread via `QueuePostProcess` | the game-thread part only resolves the session and validates parameters; `frames.jsonl` is streamed twice (indices in range, then the selected records) so a long session is never loaded whole; an unterminated last line (being written) is skipped |
+
+Timestamps: the copy enqueued on tick N captures frame N-1's render, and the ticker runs before
+the world ticks, so the actor sample and world time taken on tick N describe exactly the state
+frame N-1 rendered. `t` in every record is seconds since the recording started; `world_time`
+is the PIE world clock.
+
+Log capture: the session is an `FOutputDevice` that accepts calls on any thread
+(`CanBeUsedOnAnyThread`), registered with `GLog` while recording; lines at verbosity Log and
+above, minus the plugin's own categories, become timeline records (capped at 20,000 per
+session). Actor events are generic: pawns and `MCPTrack`-tagged actors by default, or the
+classes/tags in `actor_filter`; `state_changed` compares Blueprint-visible bools and numbers
+through reflection. No game-specific names anywhere.
+
+Lifetime: the session unhooks its ticker, the log, `FEditorDelegates::EndPIE` and
+`FCoreDelegates::OnPreExit` in `Finish()`, then enqueues a final poll (which blocks until the
+GPU is idle so the last frame is not lost), flushes rendering commands, and joins the worker.
+Only after that can the object be destroyed, which is why render commands may capture `this`.
+`Finish()` is reached from the duration cap, `stop_recording`, PIE ending, editor pre-exit and
+plugin shutdown, whichever comes first. When the tool started PIE itself, a fixed 1/30 s time
+step and a fixed random seed are applied for the session and restored afterwards.
+
+Fallback: a PIE viewport without a separate render target (it draws straight into the window)
+has no texture to copy; those frames use the synchronous viewport readback and the manifest
+says so (`source_format: "sync:..."`, a note). Not observed in the editor, where the PIE
+viewport is composited by Slate and always has one.

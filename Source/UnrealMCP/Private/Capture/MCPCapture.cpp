@@ -32,21 +32,80 @@
 
 DEFINE_LOG_CATEGORY_STATIC(LogMCPCapture, Log, All);
 
+TSharedPtr<FJsonObject> MCPCapture::MakeError(const FString& Code, const FString& Message, const FString& Hint)
+{
+	auto Err = MakeShared<FJsonObject>();
+	Err->SetStringField(TEXT("code"), Code);
+	Err->SetStringField(TEXT("message"), Message);
+	if (!Hint.IsEmpty())
+	{
+		Err->SetStringField(TEXT("hint"), Hint);
+	}
+	auto R = MakeShared<FJsonObject>();
+	R->SetBoolField(TEXT("success"), false);
+	R->SetObjectField(TEXT("error"), Err);
+	return R;
+}
+
+void MCPCapture::FitSize(int32 SrcW, int32 SrcH, int32& InOutW, int32& InOutH)
+{
+	if (SrcW <= 0 || SrcH <= 0)
+	{
+		return;
+	}
+	const double Fit = FMath::Min(static_cast<double>(InOutW) / SrcW, static_cast<double>(InOutH) / SrcH);
+	InOutW = FMath::Max(16, FMath::RoundToInt(SrcW * Fit));
+	InOutH = FMath::Max(16, FMath::RoundToInt(SrcH * Fit));
+}
+
+void MCPCapture::BoxResize(TArray<FColor>& Pixels, int32 SrcW, int32 SrcH, int32 DstW, int32 DstH)
+{
+	if (SrcW != DstW || SrcH != DstH)
+	{
+		TArray<FColor> Resized;
+		Resized.SetNumUninitialized(DstW * DstH);
+		for (int32 y = 0; y < DstH; ++y)
+		{
+			const int32 Y0 = y * SrcH / DstH, Y1 = FMath::Max(Y0 + 1, (y + 1) * SrcH / DstH);
+			for (int32 x = 0; x < DstW; ++x)
+			{
+				const int32 X0 = x * SrcW / DstW, X1 = FMath::Max(X0 + 1, (x + 1) * SrcW / DstW);
+				uint32 R = 0, G = 0, B = 0, N = 0;
+				for (int32 sy = Y0; sy < Y1; ++sy)
+					for (int32 sx = X0; sx < X1; ++sx)
+					{
+						const FColor& S = Pixels[sy * SrcW + sx];
+						R += S.R; G += S.G; B += S.B; ++N;
+					}
+				Resized[y * DstW + x] = FColor(R / N, G / N, B / N, 255);
+			}
+		}
+		Pixels = MoveTemp(Resized);
+		return;
+	}
+	for (FColor& C : Pixels)
+	{
+		C.A = 255; // the image is opaque by definition
+	}
+}
+
+bool MCPCapture::EncodeImage(const TArray<FColor>& Pixels, int32 Width, int32 Height, const FString& Format, int32 Quality, TArray64<uint8>& OutBytes)
+{
+	IImageWrapperModule& Module = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
+	TSharedPtr<IImageWrapper> Wrapper = Module.CreateImageWrapper(Format == TEXT("png") ? EImageFormat::PNG : EImageFormat::JPEG);
+	OutBytes.Reset();
+	if (Wrapper.IsValid() && Wrapper->SetRaw(Pixels.GetData(), Pixels.Num() * sizeof(FColor), Width, Height, ERGBFormat::BGRA, 8))
+	{
+		OutBytes = Wrapper->GetCompressed(Format == TEXT("png") ? 0 : Quality);
+	}
+	return OutBytes.Num() > 0;
+}
+
 namespace
 {
 	TSharedPtr<FJsonObject> CaptureError(const FString& Code, const FString& Message, const FString& Hint = FString())
 	{
-		auto Err = MakeShared<FJsonObject>();
-		Err->SetStringField(TEXT("code"), Code);
-		Err->SetStringField(TEXT("message"), Message);
-		if (!Hint.IsEmpty())
-		{
-			Err->SetStringField(TEXT("hint"), Hint);
-		}
-		auto R = MakeShared<FJsonObject>();
-		R->SetBoolField(TEXT("success"), false);
-		R->SetObjectField(TEXT("error"), Err);
-		return R;
+		return MCPCapture::MakeError(Code, Message, Hint);
 	}
 
 	TSharedPtr<FJsonObject> VectorJson(const FVector& V)
@@ -445,9 +504,7 @@ namespace
 			SrcW = Size.X; SrcH = Size.Y;
 			// The viewport has its own aspect; fit the requested size around it rather than
 			// squash the frame (a 2.9:1 editor viewport into 16:9 would distort everything).
-			const double Fit = FMath::Min(static_cast<double>(Width) / SrcW, static_cast<double>(Height) / SrcH);
-			Width = FMath::Max(16, FMath::RoundToInt(SrcW * Fit));
-			Height = FMath::Max(16, FMath::RoundToInt(SrcH * Fit));
+			MCPCapture::FitSize(SrcW, SrcH, Width, Height);
 			bRead = View.Viewport->ReadPixels(Pixels, FReadSurfaceDataFlags(RCM_UNorm, CubeFace_MAX), FIntRect(0, 0, SrcW, SrcH));
 			TRead = FPlatformTime::Seconds();
 			if (!bRead || Pixels.Num() != SrcW * SrcH)
@@ -575,40 +632,10 @@ namespace
 		{
 			check(!IsInGameThread());
 			const double TEnc0 = FPlatformTime::Seconds();
-			if (SrcW != Width || SrcH != Height)
-			{
-				// Box-filter resize (viewport size -> requested size); off the game thread.
-				TArray<FColor> Resized;
-				Resized.SetNumUninitialized(Width * Height);
-				for (int32 y = 0; y < Height; ++y)
-				{
-					const int32 Y0 = y * SrcH / Height, Y1 = FMath::Max(Y0 + 1, (y + 1) * SrcH / Height);
-					for (int32 x = 0; x < Width; ++x)
-					{
-						const int32 X0 = x * SrcW / Width, X1 = FMath::Max(X0 + 1, (x + 1) * SrcW / Width);
-						uint32 R = 0, G = 0, B = 0, N = 0;
-						for (int32 sy = Y0; sy < Y1; ++sy)
-							for (int32 sx = X0; sx < X1; ++sx)
-							{
-								const FColor& S = Pixels[sy * SrcW + sx];
-								R += S.R; G += S.G; B += S.B; ++N;
-							}
-						Resized[y * Width + x] = FColor(R / N, G / N, B / N, 255);
-					}
-				}
-				Pixels = MoveTemp(Resized);
-			}
-			for (FColor& C : Pixels)
-			{
-				C.A = 255; // the image is opaque by definition
-			}
-			IImageWrapperModule& Module = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
-			TSharedPtr<IImageWrapper> Wrapper = Module.CreateImageWrapper(Format == TEXT("png") ? EImageFormat::PNG : EImageFormat::JPEG);
+			// Box-filter resize (viewport size -> requested size) and encode, off the game thread.
+			MCPCapture::BoxResize(Pixels, SrcW, SrcH, Width, Height);
 			TArray64<uint8> Bytes;
-			if (Wrapper.IsValid() && Wrapper->SetRaw(Pixels.GetData(), Pixels.Num() * sizeof(FColor), Width, Height, ERGBFormat::BGRA, 8))
-			{
-				Bytes = Wrapper->GetCompressed(Format == TEXT("png") ? 0 : Quality);
-			}
+			MCPCapture::EncodeImage(Pixels, Width, Height, Format, Quality, Bytes);
 			if (Bytes.Num() == 0)
 			{
 				Out = CaptureError(TEXT("encode_failed"), TEXT("Image encoding failed"));
@@ -629,6 +656,13 @@ namespace
 		});
 		return Result;
 	}
+}
+
+TSharedPtr<FJsonObject> MCPCapture::ResolvePIEView(FView& Out)
+{
+	auto Params = MakeShared<FJsonObject>();
+	Params->SetStringField(TEXT("camera"), TEXT("pie"));
+	return ResolveView(Params, Out);
 }
 
 void MCPCapture::RegisterHandlers(FMCPTcpServer& Server)
